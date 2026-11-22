@@ -33,6 +33,10 @@ make DLSS_SDK=/path/to/DLSS
 make check DLSS_SDK=/path/to/DLSS
 ```
 
+CMake works too (`cmake -B build -DDLSS_SDK=/path/to/DLSS && cmake --build build`).
+It also has a Windows (MSVC) recipe that builds `sl_ngx.dll` against the
+SDK's `nvsdk_ngx_d.lib`; that build has not been tried yet.
+
 Put `libsl_ngx.so` in a folder together with the SDK's
 `lib/Linux_x86_64/rel/libnvidia-ngx-dlss.so.*`. NGX loads the models from
 the folders given in `Preferences::pathsToPlugins`, or from the library's own
@@ -61,7 +65,7 @@ tests/smoke /folder/with/the/models rr     # Ray Reconstruction
 
 Differences from Streamline:
 
-- Vulkan only, manual hooking only. There is no interposer, no swapchain or
+- Vulkan only, manual hooking only. Linux is tested; Windows is written but untested. There is no interposer, no swapchain or
   present hooks, no D3D, no frame generation, Reflex or other features.
 - `slSetVulkanInfo` may be called with an instance and physical device but no
   device. `slGetFeatureRequirements` then also reports the device extensions

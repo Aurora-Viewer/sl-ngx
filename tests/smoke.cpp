@@ -2,8 +2,10 @@
 // only, on a real NVIDIA Vulkan device. Upscales a flat colour and checks
 // the output took it on.
 //
-//   tests/smoke <model folder> [rr]
-// Exit 0: DLSS ran and the output changed. Exit 2: not supported here.
+//   tests/smoke <model folder> [rr|both]
+// "both" runs Ray Reconstruction, then DLSS, on one device. Each feature
+// runs at Quality, then Performance (a new feature inside the evaluate).
+// Exit 0: every run wrote the input colour. Exit 2: not supported here.
 #include <vulkan/vulkan.h>
 
 #include "sl/sl.h"
@@ -139,11 +141,24 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::fprintf(stderr, "usage: %s <model folder> [rr]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model folder> [rr|both]\n", argv[0]);
         return 1;
     }
-    const bool rr = argc > 2 && std::strcmp(argv[2], "rr") == 0;
-    const sl::Feature feature = rr ? sl::kFeatureDLSS_RR : sl::kFeatureDLSS;
+    std::vector<sl::Feature> features = {sl::kFeatureDLSS};
+    if (argc > 2 && std::strcmp(argv[2], "rr") == 0)
+        features = {sl::kFeatureDLSS_RR};
+    else if (argc > 2 && std::strcmp(argv[2], "both") == 0)
+        features = {sl::kFeatureDLSS_RR, sl::kFeatureDLSS};
+    auto addAll = [](std::vector<const char*>& to, const char* const* names, uint32_t n) {
+        for (uint32_t i = 0; i < n; i++)
+        {
+            bool have = false;
+            for (auto t : to)
+                have = have || std::strcmp(t, names[i]) == 0;
+            if (!have)
+                to.push_back(strdup(names[i]));
+        }
+    };
     std::string folder = argv[1];
     std::wstring wfolder(folder.begin(), folder.end());
     const wchar_t* paths[] = {wfolder.c_str()};
@@ -163,8 +178,12 @@ int main(int argc, char** argv)
 
     // the instance, with what the feature names
     sl::FeatureRequirements req{};
-    SL(slGetFeatureRequirements(feature, req));
-    std::vector<const char*> instExts(req.vkInstanceExtensions, req.vkInstanceExtensions + req.vkNumInstanceExtensions);
+    std::vector<const char*> instExts;
+    for (auto f : features)
+    {
+        SL(slGetFeatureRequirements(f, req));
+        addAll(instExts, req.vkInstanceExtensions, req.vkNumInstanceExtensions);
+    }
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
     app.apiVersion = VK_API_VERSION_1_3;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
@@ -201,8 +220,12 @@ int main(int argc, char** argv)
     vk.instance = instance;
     vk.physicalDevice = pd;
     SL(slSetVulkanInfo(vk));
-    SL(slGetFeatureRequirements(feature, req));
-    std::vector<const char*> devExts(req.vkDeviceExtensions, req.vkDeviceExtensions + req.vkNumDeviceExtensions);
+    std::vector<const char*> devExts;
+    for (auto f : features)
+    {
+        SL(slGetFeatureRequirements(f, req));
+        addAll(devExts, req.vkDeviceExtensions, req.vkNumDeviceExtensions);
+    }
     for (auto e : devExts)
         std::printf("device extension: %s\n", e);
     uint32_t qfCount = 0;
@@ -234,6 +257,11 @@ int main(int argc, char** argv)
     vk.graphicsQueueFamily = family;
     SL(slSetVulkanInfo(vk));
 
+    int bad = 0;
+    for (const sl::Feature feature : features)
+    {
+    const bool rr = feature == sl::kFeatureDLSS_RR;
+    std::printf("--- %s\n", rr ? "Ray Reconstruction" : "DLSS");
     sl::AdapterInfo adapter{};
     adapter.vkPhysicalDevice = pd;
     sl::Result supported = slIsFeatureSupported(feature, adapter);
@@ -409,13 +437,61 @@ int main(int argc, char** argv)
         SL(slDLSSDSetOptions(viewport, o));
     }
 
-    for (uint32_t frame = 0; frame < 4; frame++)
+    for (uint32_t frame = 0; frame < 8; frame++)
     {
+        if (frame == 4)
+        {
+            // Performance: a smaller render size inside the same images, so
+            // the evaluate itself has to make a new feature
+            uint32_t w, h;
+            if (rr)
+            {
+                sl::DLSSDOptions o{};
+                o.mode = sl::DLSSMode::eMaxPerformance;
+                o.outputWidth = outW;
+                o.outputHeight = outH;
+                o.colorBuffersHDR = sl::Boolean::eTrue;
+                o.normalRoughnessMode = sl::DLSSDNormalRoughnessMode::ePacked;
+                o.worldToCameraView = o.cameraViewToWorld = identity;
+                sl::DLSSDOptimalSettings st{};
+                SL(slDLSSDGetOptimalSettings(o, st));
+                SL(slDLSSDSetOptions(viewport, o));
+                w = st.optimalRenderWidth;
+                h = st.optimalRenderHeight;
+            }
+            else
+            {
+                sl::DLSSOptions o{};
+                o.mode = sl::DLSSMode::eMaxPerformance;
+                o.outputWidth = outW;
+                o.outputHeight = outH;
+                o.colorBuffersHDR = sl::Boolean::eTrue;
+                sl::DLSSOptimalSettings st{};
+                SL(slDLSSGetOptimalSettings(o, st));
+                SL(slDLSSSetOptions(viewport, o));
+                w = st.optimalRenderWidth;
+                h = st.optimalRenderHeight;
+            }
+            std::printf("performance: render %ux%u\n", w, h);
+            inExt = {0, 0, w, h};
+            for (auto& t : tags)
+                if (t.type != sl::kBufferTypeScalingOutputColor)
+                    t.extent = inExt;
+        }
         sl::FrameToken* token = nullptr;
         SL(slGetNewFrameToken(token, nullptr));
         c.reset = frame == 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
         SL(slSetConstants(c, *token, viewport));
         VK(vkBeginCommandBuffer(cmd, &begin));
+        if (frame == 4)
+        {
+            // so only the new feature's evaluates can put the colour back
+            barrier(cmd, output, C, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+            VkClearColorValue zero{{0, 0, 0, 0}};
+            VkImageSubresourceRange range{C, 0, 1, 0, 1};
+            vkCmdClearColorImage(cmd, output.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &zero, 1, &range);
+            barrier(cmd, output, C, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+        }
         SL(slSetTagForFrame(*token, viewport, tags.data(), (uint32_t)tags.size(), (sl::CommandBuffer*)cmd));
         if (frame == 0)
             SL(slAllocateResources((sl::CommandBuffer*)cmd, feature, viewport));
@@ -432,14 +508,23 @@ int main(int argc, char** argv)
     vkCmdCopyImageToBuffer(cmd, output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
     submit();
 
-    sl::DLSSState state{};
-    if (!rr)
-        SL(slDLSSGetState(viewport, state));
-    std::printf("estimated VRAM: %llu bytes\n", (unsigned long long)state.estimatedVRAMUsageInBytes);
+    uint64_t vram = 0;
+    if (rr)
+    {
+        sl::DLSSDState st{};
+        SL(slDLSSDGetState(viewport, st));
+        vram = st.estimatedVRAMUsageInBytes;
+    }
+    else
+    {
+        sl::DLSSState st{};
+        SL(slDLSSGetState(viewport, st));
+        vram = st.estimatedVRAMUsageInBytes;
+    }
+    std::printf("estimated VRAM: %llu bytes\n", (unsigned long long)vram);
 
     uint16_t* px = nullptr;
     VK(vkMapMemory(dev, readbackMem, 0, VK_WHOLE_SIZE, 0, (void**)&px));
-    int bad = 0;
     const uint32_t samples[][2] = {{outW / 2, outH / 2}, {10, 10}, {outW - 10, outH - 10}, {outW / 3, 2 * outH / 3}};
     for (auto& s : samples)
     {
@@ -455,6 +540,7 @@ int main(int argc, char** argv)
     vkUnmapMemory(dev, readbackMem);
 
     SL(slFreeResources(feature, viewport));
+    }
     SL(slShutdown());
     std::printf(bad ? "FAIL: output did not take the input colour\n" : "PASS\n");
     return bad ? 1 : 0;

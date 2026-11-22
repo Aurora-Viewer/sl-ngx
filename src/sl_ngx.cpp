@@ -21,7 +21,11 @@
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_helpers_dlssd_vk.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <cstdarg>
 #include <cstdio>
@@ -29,9 +33,14 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#ifdef _WIN32
+#define SL_NGX_EXPORT __declspec(dllexport)
+#else
 #define SL_NGX_EXPORT __attribute__((visibility("default")))
+#endif
 
 namespace
 {
@@ -85,6 +94,7 @@ struct Viewport
     NVSDK_NGX_Handle* handle = nullptr;
     Shape shape{};
     uint64_t lastUsed = 0;
+    bool logNextEvaluate = false;
     std::map<uint32_t, Frame> frames;
 };
 
@@ -120,6 +130,14 @@ struct State
 
     std::map<uint32_t, Viewport> viewports;
     std::vector<Retired> retired;
+
+    // NGX's optimal settings by (feature, mode, output width, height)
+    struct Optimal
+    {
+        uint32_t w, h, minW, minH, maxW, maxH;
+        float sharpness;
+    };
+    std::map<std::tuple<sl::Feature, uint32_t, uint32_t, uint32_t>, Optimal> optimal;
 
     // slGetFeatureRequirements' answers live here until slShutdown
     std::map<sl::Feature, std::vector<std::string>> instanceExtNames, deviceExtNames;
@@ -162,6 +180,17 @@ bool ours(sl::Feature f)
 // library beside it, and so NGX's search path when the caller names none.
 std::wstring ownFolder()
 {
+#ifdef _WIN32
+    HMODULE module = nullptr;
+    wchar_t buf[MAX_PATH];
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(&ownFolder), &module) ||
+        !GetModuleFileNameW(module, buf, MAX_PATH))
+        return {};
+    std::wstring path = buf;
+    auto slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring(L".") : path.substr(0, slash);
+#else
     Dl_info info{};
     if (!dladdr(reinterpret_cast<void*>(&ownFolder), &info) || !info.dli_fname)
         return {};
@@ -169,6 +198,7 @@ std::wstring ownFolder()
     auto slash = path.rfind('/');
     path = slash == std::string::npos ? std::string(".") : path.substr(0, slash);
     return std::wstring(path.begin(), path.end());
+#endif
 }
 
 NVSDK_NGX_FeatureDiscoveryInfo discovery(sl::Feature feature)
@@ -222,6 +252,7 @@ void stopNgx()
         NVSDK_NGX_VULKAN_DestroyParameters(g.params);
     g.params = nullptr;
     NVSDK_NGX_VULKAN_Shutdown1(g.device);
+    g.optimal.clear();
     g.started = false;
 }
 
@@ -281,6 +312,16 @@ Result optimal(sl::Feature feature, sl::DLSSMode mode, uint32_t outW, uint32_t o
     if (mode == sl::DLSSMode::eOff || mode >= sl::DLSSMode::eCount || outW == 0 || outH == 0 ||
         outW == sl::INVALID_UINT || outH == sl::INVALID_UINT)
         return Result::eErrorInvalidParameter;
+    // asking NGX rewrites the shared parameters: once per shape is enough
+    const auto key = std::make_tuple(feature, (uint32_t)mode, outW, outH);
+    auto cached = g.optimal.find(key);
+    if (cached != g.optimal.end())
+    {
+        const auto& o = cached->second;
+        *w = o.w, *h = o.h, *minW = o.minW, *minH = o.minH, *maxW = o.maxW, *maxH = o.maxH;
+        *sharpness = o.sharpness;
+        return Result::eOk;
+    }
     auto quality = (NVSDK_NGX_PerfQuality_Value)((uint32_t)mode - 1);
     NVSDK_NGX_Result r;
     if (feature == sl::kFeatureDLSS)
@@ -317,6 +358,12 @@ Result optimal(sl::Feature feature, sl::DLSSMode mode, uint32_t outW, uint32_t o
         LOG_ERROR("sl-ngx: no optimal settings for mode %u at %ux%u: %#x", (unsigned)mode, outW, outH, (unsigned)r);
         return Result::eErrorNGXFailed;
     }
+    if (*w == 0 || *h == 0)
+    {
+        LOG_WARN("sl-ngx: NGX has no render size for mode %u at %ux%u", (unsigned)mode, outW, outH);
+        return Result::eErrorInvalidParameter;
+    }
+    g.optimal[key] = {*w, *h, *minW, *minH, *maxW, *maxH, *sharpness};
     return Result::eOk;
 }
 
@@ -507,8 +554,12 @@ Result create(VkCommandBuffer cmd, Viewport& vp, const Shape& s)
         g.retired.push_back({vp.handle, g.issued + kReleaseAfterFrames});
     vp.handle = handle;
     vp.shape = s;
-    LOG_INFO("sl-ngx: %s feature made, %ux%u to %ux%u, mode %u", rr ? "Ray Reconstruction" : "DLSS", s.renderWidth,
-        s.renderHeight, s.outWidth, s.outHeight, (unsigned)s.mode);
+    LOG_INFO("sl-ngx: %s feature made, %ux%u to %ux%u, mode %u, flags %#x, presets %u %u %u %u %u %u%s",
+        rr ? "Ray Reconstruction" : "DLSS", s.renderWidth, s.renderHeight, s.outWidth, s.outHeight, (unsigned)s.mode,
+        (unsigned)s.flags, s.presets[0], s.presets[1], s.presets[2], s.presets[3], s.presets[4], s.presets[5],
+        rr ? (s.roughnessMode == NVSDK_NGX_DLSS_Roughness_Mode_Packed ? ", roughness packed" : ", roughness unpacked")
+           : "");
+    vp.logNextEvaluate = true;
     return Result::eOk;
 }
 
@@ -577,26 +628,51 @@ Result dlssdGetOptimalSettings(const sl::DLSSDOptions& o, sl::DLSSDOptimalSettin
         &s.optimalSharpness);
 }
 
-uint64_t vramInUse()
+// What NGX's own estimate says the feature's features hold in video memory.
+Result vramInUse(sl::Feature feature, uint64_t* out)
 {
+    *out = 0;
+    if (!g.started)
+        return Result::eErrorDeviceNotCreated;
     unsigned long long bytes = 0;
-    if (g.started)
-        NGX_DLSS_GET_STATS(g.params, &bytes);
-    return bytes;
+    NVSDK_NGX_Result r;
+    if (feature == sl::kFeatureDLSS)
+    {
+        r = NGX_DLSS_GET_STATS(g.params, &bytes);
+    }
+    else
+    {
+        // DLSS-D reports through its own callback (as Streamline's DLSS-D plugin reads it)
+        void* callback = nullptr;
+        NVSDK_NGX_Parameter_GetVoidPointer(g.params, NVSDK_NGX_Parameter_DLSSDGetStatsCallback, &callback);
+        if (!callback)
+            return Result::eErrorFeatureNotSupported;
+        r = reinterpret_cast<PFN_NVSDK_NGX_DLSS_GetStatsCallback>(callback)(g.params);
+        if (!NVSDK_NGX_FAILED(r))
+            NVSDK_NGX_Parameter_GetULL(g.params, NVSDK_NGX_Parameter_SizeInBytes, &bytes);
+    }
+    if (NVSDK_NGX_FAILED(r))
+        return Result::eErrorNGXFailed;
+    *out = bytes;
+    return Result::eOk;
 }
 
 Result dlssGetState(const sl::ViewportHandle&, sl::DLSSState& s)
 {
     std::lock_guard<std::mutex> l(g.lock);
-    s.estimatedVRAMUsageInBytes = vramInUse();
-    return Result::eOk;
+    uint64_t bytes;
+    Result r = vramInUse(sl::kFeatureDLSS, &bytes);
+    s.estimatedVRAMUsageInBytes = bytes;
+    return r;
 }
 
 Result dlssdGetState(const sl::ViewportHandle&, sl::DLSSDState& s)
 {
     std::lock_guard<std::mutex> l(g.lock);
-    s.estimatedVRAMUsageInBytes = vramInUse();
-    return Result::eOk;
+    uint64_t bytes;
+    Result r = vramInUse(sl::kFeatureDLSS_RR, &bytes);
+    s.estimatedVRAMUsageInBytes = bytes;
+    return r;
 }
 
 Result dlssSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSOptions& o)
@@ -653,7 +729,7 @@ SL_NGX_EXPORT Result slInit(const sl::Preferences& pref, uint64_t sdkVersion)
         return Result::eErrorMissingInputParameter;
     }
     g.engine = (NVSDK_NGX_EngineType)pref.engine;
-    g.dataPath = pref.pathToLogsAndData ? std::wstring(pref.pathToLogsAndData) : std::wstring(L"/tmp");
+    g.dataPath = pref.pathToLogsAndData ? std::wstring(pref.pathToLogsAndData) : ownFolder();
     g.modelPaths.clear();
     for (uint32_t i = 0; i < pref.numPathsToPlugins && pref.pathsToPlugins; i++)
         if (pref.pathsToPlugins[i])
@@ -1029,6 +1105,14 @@ SL_NGX_EXPORT Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken
     const float mvx = c.mvecScale.x * (float)inExt.width;
     const float mvy = c.mvecScale.y * (float)inExt.height;
     const int reset = c.reset == sl::Boolean::eTrue ? 1 : 0;
+    if (vp.logNextEvaluate)
+    {
+        vp.logNextEvaluate = false;
+        LOG_INFO("sl-ngx: first evaluate: jitter %.4f %.4f, motion scale %.1f %.1f, reset %d, render %ux%u at %u,%u, "
+                 "output %ux%u, exposure %s",
+            c.jitterOffset.x, c.jitterOffset.y, mvx, mvy, reset, inExt.width, inExt.height, inExt.left, inExt.top,
+            outExt.width, outExt.height, exposure ? "tagged" : "auto");
+    }
 
     NVSDK_NGX_Result nr;
     if (rr)
