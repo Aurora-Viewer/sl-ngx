@@ -1,0 +1,160 @@
+BaseStructure            size 32 align 8
+  next                                 0
+  structType                           8
+  structVersion                        24
+Resource                 size 112 align 8
+  type                                 32
+  native                               40
+  memory                               48
+  view                                 56
+  state                                64
+  width                                68
+  height                               72
+  nativeFormat                         76
+  mipLevels                            80
+  arrayLayers                          84
+  gpuVirtualAddress                    88
+  flags                                96
+  usage                                100
+  internalFlags                        104
+ResourceTag              size 64 align 8
+  resource                             32
+  type                                 40
+  lifecycle                            44
+  extent                               48
+Extent                   size 16 align 4
+Constants                size 456 align 8
+  cameraViewToClip                     32
+  clipToCameraView                     96
+  clipToLensClip                       160
+  clipToPrevClip                       224
+  prevClipToClip                       288
+  jitterOffset                         352
+  mvecScale                            360
+  cameraPinholeOffset                  368
+  cameraPos                            376
+  cameraUp                             388
+  cameraRight                          400
+  cameraFwd                            412
+  cameraNear                           424
+  cameraFar                            428
+  cameraFOV                            432
+  cameraAspectRatio                    436
+  motionVectorsInvalidValue            440
+  depthInverted                        444
+  cameraMotionIncluded                 445
+  motionVectors3D                      446
+  reset                                447
+  orthographicProjection               448
+  motionVectorsDilated                 449
+  motionVectorsJittered                450
+  minRelativeLinearDepthObjectSeparation 452
+DLSSOptions              size 88 align 8
+  mode                                 32
+  outputWidth                          36
+  outputHeight                         40
+  sharpness                            44
+  preExposure                          48
+  exposureScale                        52
+  colorBuffersHDR                      56
+  indicatorInvertAxisX                 57
+  indicatorInvertAxisY                 58
+  dlaaPreset                           60
+  qualityPreset                        64
+  balancedPreset                       68
+  performancePreset                    72
+  ultraPerformancePreset               76
+  ultraQualityPreset                   80
+  useAutoExposure                      84
+  alphaUpscalingEnabled                85
+DLSSOptimalSettings      size 64 align 8
+  optimalRenderWidth                   32
+  optimalRenderHeight                  36
+  optimalSharpness                     40
+  renderWidthMin                       44
+  renderHeightMin                      48
+  renderWidthMax                       52
+  renderHeightMax                      56
+DLSSState                size 40 align 8
+  estimatedVRAMUsageInBytes            32
+DLSSDOptions             size 224 align 8
+  mode                                 32
+  outputWidth                          36
+  outputHeight                         40
+  sharpness                            44
+  preExposure                          48
+  exposureScale                        52
+  colorBuffersHDR                      56
+  indicatorInvertAxisX                 57
+  indicatorInvertAxisY                 58
+  normalRoughnessMode                  60
+  worldToCameraView                    64
+  cameraViewToWorld                    128
+  alphaUpscalingEnabled                192
+  dlaaPreset                           196
+  qualityPreset                        200
+  balancedPreset                       204
+  performancePreset                    208
+  ultraPerformancePreset               212
+  ultraQualityPreset                   216
+DLSSDOptimalSettings     size 64 align 8
+DLSSDState               size 40 align 8
+Preferences              size 144 align 8
+  showConsole                          32
+  logLevel                             36
+  pathsToPlugins                       40
+  numPathsToPlugins                    48
+  pathToLogsAndData                    56
+  allocateCallback                     64
+  releaseCallback                      72
+  logMessageCallback                   80
+  flags                                88
+  featuresToLoad                       96
+  numFeaturesToLoad                    104
+  applicationId                        108
+  engine                               112
+  engineVersion                        120
+  projectId                            128
+  renderAPI                            136
+VulkanInfo               size 96 align 8
+  device                               32
+  instance                             40
+  physicalDevice                       48
+  computeQueueIndex                    56
+  computeQueueFamily                   60
+  graphicsQueueIndex                   64
+  graphicsQueueFamily                  68
+  opticalFlowQueueIndex                72
+  opticalFlowQueueFamily               76
+  useNativeOpticalFlowMode             80
+  computeQueueCreateFlags              84
+  graphicsQueueCreateFlags             88
+  opticalFlowQueueCreateFlags          92
+FeatureRequirements      size 184 align 8
+  flags                                32
+  maxNumCPUThreads                     36
+  maxNumViewports                      40
+  numRequiredTags                      44
+  requiredTags                         48
+  osVersionDetected                    56
+  osVersionRequired                    68
+  driverVersionDetected                80
+  driverVersionRequired                92
+  vkNumComputeQueuesRequired           104
+  vkNumGraphicsQueuesRequired          108
+  vkNumDeviceExtensions                112
+  vkDeviceExtensions                   120
+  vkNumInstanceExtensions              128
+  vkInstanceExtensions                 136
+  vkNumFeatures12                      144
+  vkFeatures12                         152
+  vkNumFeatures13                      160
+  vkFeatures13                         168
+  vkNumOpticalFlowQueuesRequired       176
+AdapterInfo              size 56 align 8
+  deviceLUID                           32
+  deviceLUIDSizeInBytes                40
+  vkPhysicalDevice                     48
+ViewportHandle           size 40 align 8
+FeatureVersion           size 56 align 8
+kSDKVersion 0x2000e0010fedc
