@@ -120,6 +120,10 @@ struct State
     VkInstance instance = VK_NULL_HANDLE;
     VkPhysicalDevice physicalDevice = VK_NULL_HANDLE;
     VkDevice device = VK_NULL_HANDLE;
+    // the instance and physical device slGetFeatureRequirements asks NGX
+    // about: the last VulkanInfo's, with a device or without
+    VkInstance queryInstance = VK_NULL_HANDLE;
+    VkPhysicalDevice queryPhysicalDevice = VK_NULL_HANDLE;
     bool started = false;
     NVSDK_NGX_Parameter* params = nullptr;
 
@@ -254,6 +258,27 @@ void stopNgx()
     NVSDK_NGX_VULKAN_Shutdown1(g.device);
     g.optimal.clear();
     g.started = false;
+}
+
+// Leaves NGX started on the device it was started on, with no NGX call at
+// all: that device may be lost, and releasing or shutting down there can
+// hang. NGX keeps one instance per device, so it starts again beside it on
+// the next one. The caller keeps the old VkDevice alive (NGX still holds
+// objects on it).
+void abandonNgx()
+{
+    if (!g.started)
+        return;
+    size_t kept = g.retired.size();
+    for (auto& [id, vp] : g.viewports)
+        if (vp.handle)
+            kept++;
+    g.viewports.clear();
+    g.retired.clear();
+    g.params = nullptr;
+    g.optimal.clear();
+    g.started = false;
+    LOG_WARN("sl-ngx: NGX left started on the previous device (%zu features kept there)", kept);
 }
 
 Result startNgx()
@@ -590,12 +615,12 @@ Result requirementsFor(sl::Feature feature)
     if (!NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&info, &count, &props)))
         for (uint32_t i = 0; i < count && props; i++)
             add(inst, props[i].extensionName);
-    if (g.instance && g.physicalDevice)
+    if (g.queryInstance && g.queryPhysicalDevice)
     {
         count = 0;
         props = nullptr;
         if (!NVSDK_NGX_FAILED(NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
-                g.instance, g.physicalDevice, &info, &count, &props)))
+                g.queryInstance, g.queryPhysicalDevice, &info, &count, &props)))
             for (uint32_t i = 0; i < count && props; i++)
                 add(dev, props[i].extensionName);
     }
@@ -763,6 +788,8 @@ SL_NGX_EXPORT Result slShutdown()
     g.instance = VK_NULL_HANDLE;
     g.physicalDevice = VK_NULL_HANDLE;
     g.device = VK_NULL_HANDLE;
+    g.queryInstance = VK_NULL_HANDLE;
+    g.queryPhysicalDevice = VK_NULL_HANDLE;
     g.initialized = false;
     return Result::eOk;
 }
@@ -770,7 +797,11 @@ SL_NGX_EXPORT Result slShutdown()
 // A VulkanInfo without a device names the instance and physical device
 // only, so slGetFeatureRequirements can ask NGX for that device's
 // extensions before the device is made (real Streamline makes a device of
-// its own for that). With a device, NGX starts on it.
+// its own for that), and leaves a running start as it is. With a device,
+// NGX starts on it. A different device
+// while NGX runs (a new device after a device loss) leaves NGX on the old
+// one without calling it there (abandonNgx); slShutdown is the clean end,
+// for a device that still works and is idle.
 SL_NGX_EXPORT Result slSetVulkanInfo(const sl::VulkanInfo& info)
 {
     std::lock_guard<std::mutex> l(g.lock);
@@ -778,13 +809,19 @@ SL_NGX_EXPORT Result slSetVulkanInfo(const sl::VulkanInfo& info)
         return Result::eErrorInitNotCalled;
     if (!sameType(info.structType, sl::VulkanInfo::s_structType) || !info.instance || !info.physicalDevice)
         return Result::eErrorInvalidParameter;
-    if (g.started && info.device != g.device)
-        stopNgx();
+    g.queryInstance = info.instance;
+    g.queryPhysicalDevice = info.physicalDevice;
+    // without a device: only what slGetFeatureRequirements asks about, the
+    // running start untouched (a new instance is probed before its device)
+    if (!info.device)
+        return Result::eOk;
+    if (g.started && info.device == g.device)
+        return Result::eOk;
+    if (g.started)
+        abandonNgx();
     g.instance = info.instance;
     g.physicalDevice = info.physicalDevice;
     g.device = info.device;
-    if (!info.device || g.started)
-        return Result::eOk;
     return startNgx();
 }
 

@@ -2,8 +2,10 @@
 // only, on a real NVIDIA Vulkan device. Upscales a flat colour and checks
 // the output took it on.
 //
-//   tests/smoke <model folder> [rr|both]
-// "both" runs Ray Reconstruction, then DLSS, on one device. Each feature
+//   tests/smoke <model folder> [rr|both|abandon]
+// "both" runs Ray Reconstruction, then DLSS, on one device. "abandon" runs
+// DLSS on one device, leaves its feature there and runs DLSS again on a
+// second device (as after a device loss: no NGX call on the first). Each feature
 // runs at Quality, then Performance (a new feature inside the evaluate).
 // Exit 0: every run wrote the input colour. Exit 2: not supported here.
 #include <vulkan/vulkan.h>
@@ -141,7 +143,7 @@ int main(int argc, char** argv)
 {
     if (argc < 2)
     {
-        std::fprintf(stderr, "usage: %s <model folder> [rr|both]\n", argv[0]);
+        std::fprintf(stderr, "usage: %s <model folder> [rr|both|abandon]\n", argv[0]);
         return 1;
     }
     std::vector<sl::Feature> features = {sl::kFeatureDLSS};
@@ -149,6 +151,9 @@ int main(int argc, char** argv)
         features = {sl::kFeatureDLSS_RR};
     else if (argc > 2 && std::strcmp(argv[2], "both") == 0)
         features = {sl::kFeatureDLSS_RR, sl::kFeatureDLSS};
+    const bool abandon = argc > 2 && std::strcmp(argv[2], "abandon") == 0;
+    if (abandon)
+        features = {sl::kFeatureDLSS, sl::kFeatureDLSS};
     auto addAll = [](std::vector<const char*>& to, const char* const* names, uint32_t n) {
         for (uint32_t i = 0; i < n; i++)
         {
@@ -258,8 +263,19 @@ int main(int argc, char** argv)
     SL(slSetVulkanInfo(vk));
 
     int bad = 0;
+    size_t run = 0;
     for (const sl::Feature feature : features)
     {
+    if (abandon && run++ == 1)
+    {
+        // the first device is kept (never destroyed: NGX holds objects on
+        // it) and a second one takes over
+        VK(vkCreateDevice(pd, &dci, nullptr, &dev));
+        vkGetDeviceQueue(dev, family, 0, &queue);
+        vk.device = dev;
+        SL(slSetVulkanInfo(vk));
+        std::printf("--- second device\n");
+    }
     const bool rr = feature == sl::kFeatureDLSS_RR;
     std::printf("--- %s\n", rr ? "Ray Reconstruction" : "DLSS");
     sl::AdapterInfo adapter{};
@@ -539,7 +555,8 @@ int main(int argc, char** argv)
     }
     vkUnmapMemory(dev, readbackMem);
 
-    SL(slFreeResources(feature, viewport));
+    if (!abandon || run == 2)
+        SL(slFreeResources(feature, viewport));
     }
     SL(slShutdown());
     std::printf(bad ? "FAIL: output did not take the input colour\n" : "PASS\n");

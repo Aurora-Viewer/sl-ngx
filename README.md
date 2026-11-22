@@ -50,6 +50,7 @@ To check it on your GPU:
 make tests/smoke-build DLSS_SDK=/path/to/DLSS
 tests/smoke /folder/with/the/models        # DLSS
 tests/smoke /folder/with/the/models rr     # Ray Reconstruction
+tests/smoke /folder/with/the/models abandon  # DLSS again on a second device
 ```
 
 ## What is implemented
@@ -71,6 +72,12 @@ Differences from Streamline:
   device. `slGetFeatureRequirements` then also reports the device extensions
   NGX needs on that device, so the application can create its device with
   them (Streamline makes a device of its own for this).
+  A call without a device leaves NGX running on the current one.
+- `slSetVulkanInfo` with a different device while NGX runs (a new device
+  after a device loss) leaves NGX on the old device without calling it there
+  and starts it on the new one. Keep the old `VkDevice` alive: NGX still
+  holds objects on it. Call `slShutdown` instead to end NGX on a device that
+  still works and is idle.
 - Resources are never copied: a tag must be `eValidUntilEvaluate` or
   `eValidUntilPresent` and stay valid until the evaluate it is used in.
   `eOnlyValidNow` is refused.

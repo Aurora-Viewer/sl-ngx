@@ -16,7 +16,7 @@ libsl_ngx.so: src/sl_ngx.cpp exports.map $(wildcard include/sl/*.h)
 check: libsl_ngx.so
 	tests/check-exports.sh libsl_ngx.so
 	tests/check-no-ngx-definitions.sh
-	$(CXX) -std=c++17 -Iinclude tests/layout.cpp -o tests/layout && tests/layout | diff -u tests/layout.expected -
+	$(CXX) -std=c++17 -Wno-deprecated-declarations -Iinclude tests/layout.cpp -o tests/layout && tests/layout | diff -u tests/layout.expected -
 
 clean:
 	rm -f libsl_ngx.so tests/layout tests/smoke

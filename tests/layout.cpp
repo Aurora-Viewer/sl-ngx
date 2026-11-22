@@ -11,6 +11,19 @@
 #define S(t) std::printf("%-24s size %zu align %zu\n", #t, sizeof(sl::t), alignof(sl::t))
 #define F(t, f) std::printf("  %-36s %zu\n", #f, offsetof(sl::t, f))
 
+// a struct's type id (its GUID's 16 bytes as laid out) and the version a
+// default-constructed one carries
+template <typename T> void id(const char* name)
+{
+    T v{};
+    const unsigned char* b = reinterpret_cast<const unsigned char*>(&v.structType);
+    std::printf("%-24s id", name);
+    for (int i = 0; i < 16; i++)
+        std::printf(" %02x", b[i]);
+    std::printf(" version %zu\n", (size_t)v.structVersion);
+}
+#define ID(t) id<sl::t>(#t)
+
 #pragma GCC diagnostic ignored "-Winvalid-offsetof"
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 int main()
@@ -70,5 +83,8 @@ int main()
     S(AdapterInfo); F(AdapterInfo, deviceLUID); F(AdapterInfo, deviceLUIDSizeInBytes); F(AdapterInfo, vkPhysicalDevice);
     S(ViewportHandle); S(FeatureVersion);
     std::printf("kSDKVersion %#llx\n", (unsigned long long)sl::kSDKVersion);
+    ID(Preferences); ID(VulkanInfo); ID(FeatureRequirements); ID(Resource); ID(ResourceTag); ID(Constants);
+    ID(DLSSOptions); ID(DLSSOptimalSettings); ID(DLSSState); ID(DLSSDOptions); ID(DLSSDOptimalSettings);
+    ID(DLSSDState); ID(ViewportHandle); ID(AdapterInfo); ID(FeatureVersion);
     return 0;
 }
