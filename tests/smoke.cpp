@@ -2,7 +2,7 @@
 // only, on a real NVIDIA Vulkan device. Upscales a flat colour and checks
 // the output took it on.
 //
-//   tests/smoke <model folder> [rr|both|abandon]
+//   tests/smoke <model folder> [rr|both|abandon|fg]
 // "both" runs Ray Reconstruction, then DLSS, on one device. "abandon" runs
 // DLSS on one device, leaves its feature there and runs DLSS again on a
 // second device (as after a device loss: no NGX call on the first). Each feature
@@ -139,6 +139,169 @@ static void logMessage(sl::LogType type, const char* msg)
     std::fprintf(stderr, "[sl %d] %s\n", (int)type, msg);
 }
 
+// Frame generation: the same flat frame twice over, with no motion, so the
+// frame NGX puts between them must be that frame again.
+static int frameGeneration(VkQueue queue, uint32_t family)
+{
+    std::printf("--- Frame Generation\n");
+    sl::AdapterInfo adapter{};
+    adapter.vkPhysicalDevice = pd;
+    sl::Result supported = slIsFeatureSupported(sl::kFeatureDLSS_G, adapter);
+    std::printf("supported: %d\n", (int)supported);
+    if (supported != sl::Result::eOk)
+        return 2;
+
+    const uint32_t w = 1920, h = 1080;
+    const VkImageUsageFlags in = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+    Image hudless = makeImage(w, h, VK_FORMAT_R8G8B8A8_UNORM, in, VK_IMAGE_ASPECT_COLOR_BIT);
+    Image depth = makeImage(w, h, VK_FORMAT_D32_SFLOAT, in, VK_IMAGE_ASPECT_DEPTH_BIT);
+    Image motion = makeImage(w, h, VK_FORMAT_R16G16_SFLOAT, in, VK_IMAGE_ASPECT_COLOR_BIT);
+    Image output = makeImage(w, h, VK_FORMAT_R8G8B8A8_UNORM,
+        VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+            VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        VK_IMAGE_ASPECT_COLOR_BIT);
+
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = (VkDeviceSize)w * h * 4;
+    bci.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    VkBuffer readback;
+    VK(vkCreateBuffer(dev, &bci, nullptr, &readback));
+    VkMemoryRequirements mr;
+    vkGetBufferMemoryRequirements(dev, readback, &mr);
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.allocationSize = mr.size;
+    ai.memoryTypeIndex =
+        memoryType(mr.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    VkDeviceMemory readbackMem;
+    VK(vkAllocateMemory(dev, &ai, nullptr, &readbackMem));
+    VK(vkBindBufferMemory(dev, readback, readbackMem, 0));
+
+    VkCommandPoolCreateInfo pci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    pci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    pci.queueFamilyIndex = family;
+    VkCommandPool pool;
+    VK(vkCreateCommandPool(dev, &pci, nullptr, &pool));
+    VkCommandBufferAllocateInfo cai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cai.commandPool = pool;
+    cai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cai.commandBufferCount = 1;
+    VkCommandBuffer cmd;
+    VK(vkAllocateCommandBuffers(dev, &cai, &cmd));
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence;
+    VK(vkCreateFence(dev, &fci, nullptr, &fence));
+    auto submit = [&] {
+        VK(vkEndCommandBuffer(cmd));
+        VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        si.commandBufferCount = 1;
+        si.pCommandBuffers = &cmd;
+        VK(vkQueueSubmit(queue, 1, &si, fence));
+        VK(vkWaitForFences(dev, 1, &fence, VK_TRUE, 5000000000ull));
+        VK(vkResetFences(dev, 1, &fence));
+    };
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+
+    const float want[3] = {0.25f, 0.5f, 0.75f};
+    const VkImageAspectFlags C = VK_IMAGE_ASPECT_COLOR_BIT;
+    VK(vkBeginCommandBuffer(cmd, &begin));
+    auto clear = [&](Image& im, VkClearColorValue v) {
+        barrier(cmd, im, C, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+        VkImageSubresourceRange range{C, 0, 1, 0, 1};
+        vkCmdClearColorImage(cmd, im.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &v, 1, &range);
+    };
+    clear(hudless, {{want[0], want[1], want[2], 1.0f}});
+    clear(motion, {{0, 0, 0, 0}});
+    clear(output, {{0, 0, 0, 0}});
+    barrier(cmd, depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    VkClearDepthStencilValue far{1.0f, 0};
+    VkImageSubresourceRange drange{VK_IMAGE_ASPECT_DEPTH_BIT, 0, 1, 0, 1};
+    vkCmdClearDepthStencilImage(cmd, depth.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &far, 1, &drange);
+    for (Image* im : {&hudless, &motion})
+        barrier(cmd, *im, C, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    barrier(cmd, depth, VK_IMAGE_ASPECT_DEPTH_BIT, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+    barrier(cmd, output, C, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL);
+    submit();
+
+    const auto RO = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    sl::Resource rHudless = resourceOf(hudless, RO), rDepth = resourceOf(depth, RO), rMotion = resourceOf(motion, RO),
+                 rOut = resourceOf(output, VK_IMAGE_LAYOUT_GENERAL);
+    const auto L = sl::ResourceLifecycle::eValidUntilEvaluate;
+    sl::Extent ext{0, 0, w, h};
+    sl::ResourceTag tags[] = {
+        sl::ResourceTag(&rHudless, sl::kBufferTypeHUDLessColor, L, &ext),
+        sl::ResourceTag(&rDepth, sl::kBufferTypeDepth, L, &ext),
+        sl::ResourceTag(&rMotion, sl::kBufferTypeMotionVectors, L, &ext),
+    };
+    // the output goes with the evaluate, not with the frame's tags
+    sl::ResourceTag outTag(&rOut, sl::kBufferTypeScalingOutputColor, L, &ext);
+
+    sl::Constants c{};
+    sl::float4x4 identity;
+    identity.setRow(0, {1, 0, 0, 0});
+    identity.setRow(1, {0, 1, 0, 0});
+    identity.setRow(2, {0, 0, 1, 0});
+    identity.setRow(3, {0, 0, 0, 1});
+    c.cameraViewToClip = c.clipToCameraView = c.clipToLensClip = c.clipToPrevClip = c.prevClipToClip = identity;
+    c.jitterOffset = {0, 0};
+    c.mvecScale = {1.0f / w, 1.0f / h};
+    c.cameraPinholeOffset = {0, 0};
+    c.cameraPos = {0, 0, 0};
+    c.cameraUp = {0, 1, 0};
+    c.cameraRight = {1, 0, 0};
+    c.cameraFwd = {0, 0, -1};
+    c.cameraNear = 0.1f;
+    c.cameraFar = 1000.0f;
+    c.cameraFOV = 1.0f;
+    c.cameraAspectRatio = (float)w / h;
+    c.depthInverted = sl::Boolean::eFalse;
+    c.cameraMotionIncluded = sl::Boolean::eTrue;
+    c.motionVectors3D = sl::Boolean::eFalse;
+    c.orthographicProjection = sl::Boolean::eFalse;
+    c.motionVectorsDilated = sl::Boolean::eFalse;
+    c.motionVectorsJittered = sl::Boolean::eFalse;
+
+    sl::ViewportHandle viewport(9);
+    for (uint32_t frame = 0; frame < 8; frame++)
+    {
+        sl::FrameToken* token = nullptr;
+        SL(slGetNewFrameToken(token, nullptr));
+        c.reset = frame == 0 ? sl::Boolean::eTrue : sl::Boolean::eFalse;
+        SL(slSetConstants(c, *token, viewport));
+        VK(vkBeginCommandBuffer(cmd, &begin));
+        SL(slSetTagForFrame(*token, viewport, tags, 3, (sl::CommandBuffer*)cmd));
+        if (frame == 0)
+            SL(slAllocateResources((sl::CommandBuffer*)cmd, sl::kFeatureDLSS_G, viewport));
+        const sl::BaseStructure* inputs[] = {&viewport, &outTag};
+        SL(slEvaluateFeature(sl::kFeatureDLSS_G, *token, inputs, 2, (sl::CommandBuffer*)cmd));
+        submit();
+    }
+
+    VK(vkBeginCommandBuffer(cmd, &begin));
+    barrier(cmd, output, C, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+    VkBufferImageCopy copy{};
+    copy.imageSubresource = {C, 0, 0, 1};
+    copy.imageExtent = {w, h, 1};
+    vkCmdCopyImageToBuffer(cmd, output.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback, 1, &copy);
+    submit();
+
+    int bad = 0;
+    uint8_t* px = nullptr;
+    VK(vkMapMemory(dev, readbackMem, 0, VK_WHOLE_SIZE, 0, (void**)&px));
+    const uint32_t samples[][2] = {{w / 2, h / 2}, {10, 10}, {w - 10, h - 10}, {w / 3, 2 * h / 3}};
+    for (auto& s : samples)
+    {
+        const uint8_t* p = px + ((size_t)s[1] * w + s[0]) * 4;
+        float r = p[0] / 255.0f, g = p[1] / 255.0f, b = p[2] / 255.0f;
+        std::printf("pixel %u,%u: %.3f %.3f %.3f\n", s[0], s[1], r, g, b);
+        if (std::fabs(r - want[0]) > 0.05f || std::fabs(g - want[1]) > 0.05f || std::fabs(b - want[2]) > 0.05f)
+            bad++;
+    }
+    vkUnmapMemory(dev, readbackMem);
+    SL(slFreeResources(sl::kFeatureDLSS_G, viewport));
+    return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv)
 {
     if (argc < 2)
@@ -151,6 +314,9 @@ int main(int argc, char** argv)
         features = {sl::kFeatureDLSS_RR};
     else if (argc > 2 && std::strcmp(argv[2], "both") == 0)
         features = {sl::kFeatureDLSS_RR, sl::kFeatureDLSS};
+    const bool fg = argc > 2 && std::strcmp(argv[2], "fg") == 0;
+    if (fg)
+        features = {sl::kFeatureDLSS_G};
     const bool abandon = argc > 2 && std::strcmp(argv[2], "abandon") == 0;
     if (abandon)
         features = {sl::kFeatureDLSS, sl::kFeatureDLSS};
@@ -261,6 +427,14 @@ int main(int argc, char** argv)
     vk.device = dev;
     vk.graphicsQueueFamily = family;
     SL(slSetVulkanInfo(vk));
+
+    if (fg)
+    {
+        const int r = frameGeneration(queue, family);
+        SL(slShutdown());
+        std::printf(r == 0 ? "PASS\n" : r == 2 ? "not supported\n" : "FAIL: the generated frame is not the input\n");
+        return r;
+    }
 
     int bad = 0;
     size_t run = 0;

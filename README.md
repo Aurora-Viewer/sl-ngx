@@ -1,14 +1,14 @@
 # sl-ngx
 
-NVIDIA DLSS and DLSS Ray Reconstruction for Vulkan on Linux, behind
-NVIDIA Streamline's public interface.
+NVIDIA DLSS, DLSS Ray Reconstruction and DLSS Frame Generation for Vulkan
+on Linux, behind NVIDIA Streamline's public interface.
 
 [Streamline](https://github.com/NVIDIA-RTX/Streamline) is NVIDIA's
 integration layer for DLSS. Its public headers are MIT licensed, but NVIDIA
 ships Streamline for Windows only. This library implements the part of that
-interface an application needs for DLSS Super Resolution and Ray
-Reconstruction, on top of NVIDIA NGX, so a program written against
-Streamline's headers can use DLSS on Linux.
+interface an application needs for DLSS Super Resolution, Ray
+Reconstruction and Frame Generation, on top of NVIDIA NGX, so a program
+written against Streamline's headers can use DLSS on Linux.
 
 ## What is in this repository
 
@@ -43,6 +43,8 @@ the folders given in `Preferences::pathsToPlugins`, or from the library's own
 folder when there are none. Recent NVIDIA drivers ship a Ray Reconstruction
 model of their own (`libnvidia-ngx-builtin-dlssd.so`); the SDK's
 `libnvidia-ngx-dlssd.so.*` in the same folder is used where they don't.
+Frame generation needs the SDK's `libnvidia-ngx-dlssg.so.*` there too;
+without it `slIsFeatureSupported(kFeatureDLSS_G)` says it is not supported.
 
 To check it on your GPU:
 
@@ -51,6 +53,7 @@ make tests/smoke-build DLSS_SDK=/path/to/DLSS
 tests/smoke /folder/with/the/models        # DLSS
 tests/smoke /folder/with/the/models rr     # Ray Reconstruction
 tests/smoke /folder/with/the/models abandon  # DLSS again on a second device
+tests/smoke /folder/with/the/models fg     # Frame Generation
 ```
 
 ## What is implemented
@@ -59,7 +62,8 @@ tests/smoke /folder/with/the/models abandon  # DLSS again on a second device
 `slIsFeatureSupported`, `slGetFeatureVersion`, `slGetFeatureFunction`,
 `slGetNewFrameToken`, `slSetConstants`, `slSetTagForFrame`,
 `slAllocateResources`, `slFreeResources` and `slEvaluateFeature`, for
-`kFeatureDLSS` and `kFeatureDLSS_RR`. Through `slGetFeatureFunction`:
+`kFeatureDLSS`, `kFeatureDLSS_RR` and `kFeatureDLSS_G` (frame generation,
+below). Through `slGetFeatureFunction`:
 `slDLSSGetOptimalSettings`, `slDLSSGetState`, `slDLSSSetOptions` and their
 `slDLSSD*` counterparts, so the inline helpers in `sl_dlss.h` and
 `sl_dlss_d.h` work as they do with Streamline.
@@ -67,7 +71,21 @@ tests/smoke /folder/with/the/models abandon  # DLSS again on a second device
 Differences from Streamline:
 
 - Vulkan only, manual hooking only. Linux is tested; Windows is written but untested. There is no interposer, no swapchain or
-  present hooks, no D3D, no frame generation, Reflex or other features.
+  present hooks, no D3D, no Reflex or other features.
+- Frame generation is evaluated by the application, as DLSS is: there is
+  no swapchain hook to present the generated frame, and no
+  `sl_dlss_g.h` or its options. Once per rendered frame, tag
+  `kBufferTypeHUDLessColor` (the frame at display size, without the
+  interface), depth and motion vectors (as for DLSS), then call
+  `slEvaluateFeature(kFeatureDLSS_G, …)` with the viewport and, as
+  `ResourceTag`s in its inputs, the output (`kBufferTypeScalingOutputColor`,
+  a storage image) and optionally the frame as shown, with its interface
+  (`kBufferTypeScalingInputColor`; NGX then finds the interface where the
+  two frames differ and carries it into the generated frame as it is,
+  instead of interpolating it). Present the output, then the rendered
+  frame. One generated frame per rendered frame, colour buffers in LDR.
+  The feature is made at the first evaluate and again when the sizes or
+  format change; `slAllocateResources` does nothing for it.
 - `slSetVulkanInfo` may be called with an instance and physical device but no
   device. `slGetFeatureRequirements` then also reports the device extensions
   NGX needs on that device, so the application can create its device with

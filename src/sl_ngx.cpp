@@ -20,6 +20,7 @@
 #include <nvsdk_ngx_helpers.h>
 #include <nvsdk_ngx_helpers_vk.h>
 #include <nvsdk_ngx_helpers_dlssd_vk.h>
+#include <nvsdk_ngx_helpers_dlssg_vk.h>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -96,6 +97,10 @@ struct Viewport
     uint64_t lastUsed = 0;
     bool logNextEvaluate = false;
     std::map<uint32_t, Frame> frames;
+    // frame generation: its own feature beside the upscaler's
+    NVSDK_NGX_Handle* fgHandle = nullptr;
+    uint32_t fgWidth = 0, fgHeight = 0, fgFormat = 0, fgRenderWidth = 0, fgRenderHeight = 0;
+    unsigned long long fgFrameId = 0;
 };
 
 struct Retired
@@ -172,12 +177,14 @@ bool sameType(const sl::StructType& a, const sl::StructType& b)
 
 NVSDK_NGX_Feature ngxFeature(sl::Feature f)
 {
+    if (f == sl::kFeatureDLSS_G)
+        return NVSDK_NGX_Feature_FrameGeneration;
     return f == sl::kFeatureDLSS_RR ? NVSDK_NGX_Feature_RayReconstruction : NVSDK_NGX_Feature_SuperSampling;
 }
 
 bool ours(sl::Feature f)
 {
-    return f == sl::kFeatureDLSS || f == sl::kFeatureDLSS_RR;
+    return f == sl::kFeatureDLSS || f == sl::kFeatureDLSS_RR || f == sl::kFeatureDLSS_G;
 }
 
 // The folder holding this library: where the setup puts NVIDIA's model
@@ -250,6 +257,8 @@ void stopNgx()
     {
         releaseNow(vp.handle);
         vp.handle = nullptr;
+        releaseNow(vp.fgHandle);
+        vp.fgHandle = nullptr;
     }
     releaseDue(true);
     if (g.params)
@@ -271,8 +280,7 @@ void abandonNgx()
         return;
     size_t kept = g.retired.size();
     for (auto& [id, vp] : g.viewports)
-        if (vp.handle)
-            kept++;
+        kept += (vp.handle ? 1 : 0) + (vp.fgHandle ? 1 : 0);
     g.viewports.clear();
     g.retired.clear();
     g.params = nullptr;
@@ -309,8 +317,19 @@ Result supported(sl::Feature feature)
 {
     if (!g.started)
         return Result::eErrorDeviceNotCreated;
-    const bool rr = feature == sl::kFeatureDLSS_RR;
     int available = 0, needsDriver = 0, init = 0;
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        NVSDK_NGX_Parameter_GetI(g.params, NVSDK_NGX_Parameter_FrameGeneration_Available, &available);
+        if (available)
+            return Result::eOk;
+        NVSDK_NGX_Parameter_GetI(g.params, NVSDK_NGX_Parameter_FrameGeneration_NeedsUpdatedDriver, &needsDriver);
+        NVSDK_NGX_Parameter_GetI(g.params, NVSDK_NGX_Parameter_FrameGeneration_FeatureInitResult, &init);
+        LOG_WARN("sl-ngx: NGX offers no frame generation here (init result %#x, newer driver needed: %d)",
+            (unsigned)init, needsDriver);
+        return needsDriver ? Result::eErrorDriverOutOfDate : Result::eErrorFeatureNotSupported;
+    }
+    const bool rr = feature == sl::kFeatureDLSS_RR;
     NVSDK_NGX_Parameter_GetI(g.params,
         rr ? NVSDK_NGX_Parameter_SuperSamplingDenoising_Available : NVSDK_NGX_Parameter_SuperSampling_Available,
         &available);
@@ -724,6 +743,142 @@ Result dlssdSetOptions(const sl::ViewportHandle& viewport, const sl::DLSSDOption
     return Result::eOk;
 }
 
+// ---- frame generation (sl-ngx's own use of the Streamline interface) ----
+//
+// Streamline's DLSS-G hooks the swapchain and is never evaluated by the
+// application. sl-ngx has no hook: the caller evaluates kFeatureDLSS_G itself
+// once per rendered frame and presents the frame it gets back before the
+// rendered one. Tags: kBufferTypeHUDLessColor (the rendered frame, display
+// size, without the interface), depth and motion vectors (the frame's, as
+// for DLSS, at render size), and, handed with the evaluate itself (the
+// frame's own are the upscaler's): the output, kBufferTypeScalingOutputColor,
+// and optionally the frame as presented, with its interface, as
+// kBufferTypeScalingInputColor (Streamline has no tag for the backbuffer, which
+// it takes from the swapchain). Without it, the frame without interface is
+// the backbuffer. Motion vectors are taken as Streamline defines them:
+// scaled by mvecScale into [-1,1], current to previous.
+Result evaluateFg(VkCommandBuffer cmd, Viewport& vp, const sl::Constants& c, const std::map<sl::BufferType, Tag>& tags,
+    const std::map<sl::BufferType, Tag>& local)
+{
+    const Tag* hudless = findTag(tags, sl::kBufferTypeHUDLessColor);
+    const Tag* shown = findTag(local, sl::kBufferTypeScalingInputColor);
+    const Tag* back = shown ? shown : hudless;
+    const Tag* out = findTag(local, sl::kBufferTypeScalingOutputColor);
+    const Tag* depth = findTag(tags, sl::kBufferTypeDepth);
+    const Tag* mvec = findTag(tags, sl::kBufferTypeMotionVectors);
+    if (!back || !out || !depth || !mvec)
+    {
+        LOG_ERROR("sl-ngx: frame generation needs the frame without interface, depth and motion vectors tagged, "
+                  "and its output handed with the evaluate");
+        return Result::eErrorMissingInputParameter;
+    }
+    const auto bExt = extentOf(*back), oExt = extentOf(*out), dExt = extentOf(*depth), mExt = extentOf(*mvec);
+    if (!vp.fgHandle || vp.fgWidth != bExt.width || vp.fgHeight != bExt.height ||
+        vp.fgFormat != back->resource.nativeFormat || vp.fgRenderWidth != mExt.width ||
+        vp.fgRenderHeight != mExt.height)
+    {
+        if (vp.fgHandle)
+            g.retired.push_back({vp.fgHandle, g.issued + kReleaseAfterFrames});
+        vp.fgHandle = nullptr;
+        NVSDK_NGX_DLSSG_Create_Params p{};
+        p.Width = bExt.width;
+        p.Height = bExt.height;
+        p.NativeBackbufferFormat = back->resource.nativeFormat;
+        p.RenderWidth = mExt.width;
+        p.RenderHeight = mExt.height;
+        p.DynamicResolutionScaling = false;
+        NVSDK_NGX_Result r = NGX_VK_CREATE_DLSSG(cmd, 1, 1, &vp.fgHandle, g.params, &p);
+        if (NVSDK_NGX_FAILED(r) || !vp.fgHandle)
+        {
+            vp.fgHandle = nullptr;
+            LOG_ERROR("sl-ngx: NGX did not make frame generation for %ux%u (format %u) from %ux%u: %#x", bExt.width,
+                bExt.height, back->resource.nativeFormat, mExt.width, mExt.height, (unsigned)r);
+            return Result::eErrorNGXFailed;
+        }
+        vp.fgWidth = bExt.width;
+        vp.fgHeight = bExt.height;
+        vp.fgFormat = back->resource.nativeFormat;
+        vp.fgRenderWidth = mExt.width;
+        vp.fgRenderHeight = mExt.height;
+        vp.fgFrameId = 0;
+        LOG_INFO("sl-ngx: frame generation made, %ux%u (format %u), render %ux%u", bExt.width, bExt.height,
+            back->resource.nativeFormat, mExt.width, mExt.height);
+    }
+    vp.lastUsed = g.issued;
+
+    NVSDK_NGX_Resource_VK backRes = ngxImage(back->resource, false);
+    NVSDK_NGX_Resource_VK hudlessRes = hudless ? ngxImage(hudless->resource, false) : NVSDK_NGX_Resource_VK{};
+    NVSDK_NGX_Resource_VK outRes = ngxImage(out->resource, true);
+    NVSDK_NGX_Resource_VK depthRes = ngxImage(depth->resource, false);
+    NVSDK_NGX_Resource_VK mvecRes = ngxImage(mvec->resource, false);
+    NVSDK_NGX_VK_DLSSG_Eval_Params e{};
+    e.pBackbuffer = &backRes;
+    if (shown && hudless)
+        e.pHudless = &hudlessRes;
+    e.pDepth = &depthRes;
+    e.pMVecs = &mvecRes;
+    e.pOutputInterpFrame = &outRes;
+    NVSDK_NGX_DLSSG_Opt_Eval_Params o{};
+    o.multiFrameCount = 1;
+    o.multiFrameIndex = 1;
+    std::memcpy(o.cameraViewToClip, &c.cameraViewToClip, sizeof o.cameraViewToClip);
+    std::memcpy(o.clipToCameraView, &c.clipToCameraView, sizeof o.clipToCameraView);
+    std::memcpy(o.clipToLensClip, &c.clipToLensClip, sizeof o.clipToLensClip);
+    std::memcpy(o.clipToPrevClip, &c.clipToPrevClip, sizeof o.clipToPrevClip);
+    std::memcpy(o.prevClipToClip, &c.prevClipToClip, sizeof o.prevClipToClip);
+    // the backbuffer is the upscaler's output: no jitter left in it
+    o.jitterOffset[0] = o.jitterOffset[1] = 0.0f;
+    o.mvecScale[0] = c.mvecScale.x;
+    o.mvecScale[1] = c.mvecScale.y;
+    o.cameraPinholeOffset[0] = c.cameraPinholeOffset.x;
+    o.cameraPinholeOffset[1] = c.cameraPinholeOffset.y;
+    std::memcpy(o.cameraPos, &c.cameraPos, sizeof o.cameraPos);
+    std::memcpy(o.cameraUp, &c.cameraUp, sizeof o.cameraUp);
+    std::memcpy(o.cameraRight, &c.cameraRight, sizeof o.cameraRight);
+    std::memcpy(o.cameraFwd, &c.cameraFwd, sizeof o.cameraFwd);
+    o.cameraNear = c.cameraNear;
+    o.cameraFar = c.cameraFar;
+    o.cameraFOV = c.cameraFOV;
+    o.cameraAspectRatio = c.cameraAspectRatio;
+    o.colorBuffersHDR = false;
+    o.depthInverted = c.depthInverted == sl::Boolean::eTrue;
+    o.cameraMotionIncluded = c.cameraMotionIncluded == sl::Boolean::eTrue;
+    o.reset = c.reset == sl::Boolean::eTrue || vp.fgFrameId == 0;
+    o.orthoProjection = c.orthographicProjection == sl::Boolean::eTrue;
+    o.motionVectorsInvalidValue = c.motionVectorsInvalidValue;
+    o.motionVectorsDilated = c.motionVectorsDilated == sl::Boolean::eTrue;
+    o.mvecsSubrectBase = {mExt.left, mExt.top};
+    o.mvecsSubrectSize = {mExt.width, mExt.height};
+    o.depthSubrectBase = {dExt.left, dExt.top};
+    o.depthSubrectSize = {dExt.width, dExt.height};
+    o.backbufferSubrectBase = {bExt.left, bExt.top};
+    o.backbufferSubrectSize = {bExt.width, bExt.height};
+    o.outputInterpSubrectBase = {oExt.left, oExt.top};
+    o.outputInterpSubrectSize = {oExt.width, oExt.height};
+    NVSDK_NGX_Parameter_SetULL(g.params, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, ++vp.fgFrameId);
+    NVSDK_NGX_Result r = NGX_VK_EVALUATE_DLSSG(cmd, vp.fgHandle, g.params, &e, &o);
+    // the shared parameters must not keep pointers to these locals
+    for (const char* name : {NVSDK_NGX_DLSSG_Parameter_Backbuffer, NVSDK_NGX_DLSSG_Parameter_MVecs,
+             NVSDK_NGX_DLSSG_Parameter_Depth, NVSDK_NGX_DLSSG_Parameter_HUDLess, NVSDK_NGX_DLSSG_Parameter_UI,
+             NVSDK_NGX_DLSSG_Parameter_UIAlpha, NVSDK_NGX_DLSSG_Parameter_BidirectionalDistortionField,
+             NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, NVSDK_NGX_DLSSG_Parameter_OutputReal,
+             NVSDK_NGX_DLSSG_Parameter_OutputDisableInterpolation, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip,
+             NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, NVSDK_NGX_DLSSG_Parameter_ClipToLensClip,
+             NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
+        NVSDK_NGX_Parameter_SetVoidPointer(g.params, name, nullptr);
+    if (NVSDK_NGX_FAILED(r))
+    {
+        LOG_ERROR("sl-ngx: NGX frame generation failed: %#x", (unsigned)r);
+        return Result::eErrorNGXFailed;
+    }
+    if (vp.fgFrameId == 1)
+        LOG_INFO("sl-ngx: first frame generation: %ux%u from render %ux%u, motion scale %.6f %.6f, depth inverted %d, "
+                 "interface %s",
+            bExt.width, bExt.height, mExt.width, mExt.height, o.mvecScale[0], o.mvecScale[1], (int)o.depthInverted,
+            shown && hudless ? "from the hudless difference" : "none");
+    return Result::eOk;
+}
+
 } // namespace
 
 // ---- the exported interface (sl_core_api.h, sl_helpers_vk.h) ----
@@ -852,13 +1007,16 @@ SL_NGX_EXPORT Result slGetFeatureRequirements(sl::Feature feature, sl::FeatureRe
     static const sl::BufferType kRrTags[] = {sl::kBufferTypeDepth, sl::kBufferTypeMotionVectors,
         sl::kBufferTypeScalingInputColor, sl::kBufferTypeScalingOutputColor, sl::kBufferTypeAlbedo,
         sl::kBufferTypeSpecularAlbedo, sl::kBufferTypeNormalRoughness};
+    static const sl::BufferType kFgTags[] = {sl::kBufferTypeDepth, sl::kBufferTypeMotionVectors,
+        sl::kBufferTypeHUDLessColor};
     static const char* kFeatures12[] = {"timelineSemaphore", "descriptorIndexing", "bufferDeviceAddress"};
     const bool rr = feature == sl::kFeatureDLSS_RR;
+    const bool fg = feature == sl::kFeatureDLSS_G;
     req.flags = sl::FeatureRequirementFlags::eVulkanSupported;
     req.maxNumCPUThreads = 1;
     req.maxNumViewports = 0;
-    req.numRequiredTags = rr ? 7 : 4;
-    req.requiredTags = rr ? kRrTags : kDlssTags;
+    req.numRequiredTags = fg ? 3 : rr ? 7 : 4;
+    req.requiredTags = fg ? kFgTags : rr ? kRrTags : kDlssTags;
     req.vkNumComputeQueuesRequired = 0;
     req.vkNumGraphicsQueuesRequired = 0;
     req.vkNumDeviceExtensions = (uint32_t)g.deviceExts[feature].size();
@@ -1002,6 +1160,9 @@ SL_NGX_EXPORT Result slAllocateResources(sl::CommandBuffer* cmdBuffer, sl::Featu
         return Result::eErrorDeviceNotCreated;
     if (!cmdBuffer)
         return Result::eErrorInvalidParameter;
+    // frame generation is made at its first evaluate, which knows the sizes
+    if (feature == sl::kFeatureDLSS_G)
+        return Result::eOk;
     auto& vp = g.viewports[(uint32_t)viewport];
     const sl::Constants* c = latestConstants(vp);
     if (!c)
@@ -1026,6 +1187,15 @@ SL_NGX_EXPORT Result slFreeResources(sl::Feature feature, const sl::ViewportHand
     auto it = g.viewports.find((uint32_t)viewport);
     if (it == g.viewports.end())
         return Result::eOk;
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        releaseNow(it->second.fgHandle);
+        it->second.fgHandle = nullptr;
+        it->second.fgFrameId = 0;
+        if (!it->second.handle && !it->second.hasDlss && !it->second.hasDlssd)
+            g.viewports.erase(it);
+        return Result::eOk;
+    }
     if (it->second.shape.feature == feature)
     {
         releaseNow(it->second.handle);
@@ -1036,7 +1206,7 @@ SL_NGX_EXPORT Result slFreeResources(sl::Feature feature, const sl::ViewportHand
         it->second.hasDlss = false;
     else
         it->second.hasDlssd = false;
-    if (!it->second.handle && !it->second.hasDlss && !it->second.hasDlssd)
+    if (!it->second.handle && !it->second.fgHandle && !it->second.hasDlss && !it->second.hasDlssd)
         g.viewports.erase(it);
     return Result::eOk;
 }
@@ -1090,6 +1260,9 @@ SL_NGX_EXPORT Result slEvaluateFeature(sl::Feature feature, const sl::FrameToken
     std::map<sl::BufferType, Tag> tags = fit->second.tags;
     for (auto& [type, tag] : local)
         tags[type] = tag;
+
+    if (feature == sl::kFeatureDLSS_G)
+        return evaluateFg(reinterpret_cast<VkCommandBuffer>(cmdBuffer), vp, c, tags, local);
 
     const bool rr = feature == sl::kFeatureDLSS_RR;
     const Tag* colorIn = findTag(tags, sl::kBufferTypeScalingInputColor);
