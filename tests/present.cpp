@@ -5,14 +5,22 @@
 // the real one, cleared on the application's queue.
 //
 //   tests/present [frames]
+//   tests/present swap
 // Runs: Reflex off; the viewer's configuration (VK_NV_low_latency2 alone,
 // images held in TRANSFER_SRC_OPTIMAL, real frames first, a frame number
 // that repeats); a Reflex frame limit; the error codes of create and of
 // frames that break the contract; generated and real frames; real
-// frames alone; pause around a vkDeviceWaitIdle; a resize; a frame whose
-// `ready` never comes; an unbounded hand-over wait; destroy with a frame
-// queued; a presenter without VK_NV_low_latency2 (no latency reports);
-// slShutdown with a presenter alive.
+// frames alone; pause around a vkDeviceWaitIdle, and what a paused
+// presenter answers; pause straight after a frame; a resize; a frame whose
+// `ready` never comes; an unbounded hand-over wait; a hand-over with no
+// wait while one waits; destroy with a frame queued; the shown counts
+// without a next frame (where the window is on screen); a presenter
+// without VK_NV_low_latency2 (no latency reports); slShutdown with a
+// presenter alive.
+// "swap" runs only this: a presenter on a device NGX did not start on (it
+// is given a project id NGX refuses), ended by slSetVulkanInfo with another
+// device (the devices are left as they are, so the validation layer's leak
+// report is not reached).
 // Exit 0: every check held and the validation layer reported no error.
 // Exit 2: no NVIDIA device or not supported here.
 #include <vulkan/vulkan.h>
@@ -32,6 +40,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <thread>
 #include <vector>
 
 #define VK(x)                                                                                                   \
@@ -327,7 +336,8 @@ SlngxPresenter* makePresenter(const Gpu& g, VkSurfaceKHR surface, uint32_t bits)
 
 int main(int argc, char** argv)
 {
-    const int frames = argc > 1 ? std::atoi(argv[1]) : 240;
+    const bool swapMode = argc > 1 && !std::strcmp(argv[1], "swap");
+    const int frames = argc > 1 && !swapMode ? std::atoi(argv[1]) : 240;
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
         std::fprintf(stderr, "SDL_Init: %s\n", SDL_GetError());
@@ -476,6 +486,55 @@ int main(int argc, char** argv)
         return 2;
     }
 
+    if (swapMode)
+    {
+        // NGX starts on any device it is given (even one with the swapchain
+        // alone, or another vendor's): a project id it refuses keeps it from
+        // starting, the case of a device NGX did not start on
+        slShutdown();
+        pref.projectId = "not-a-project-id";
+        SL(slInit(pref, sl::kSDKVersion));
+        auto bareDevice = [&] {
+            VkPhysicalDeviceVulkan12Features f{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+            f.timelineSemaphore = VK_TRUE;
+            const char* ext = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+            float prio[2] = {1.0f, 1.0f};
+            VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
+            q.queueFamilyIndex = 0;
+            q.queueCount = 2;
+            q.pQueuePriorities = prio;
+            VkDeviceCreateInfo ci{VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
+            ci.pNext = &f;
+            ci.queueCreateInfoCount = 1;
+            ci.pQueueCreateInfos = &q;
+            ci.enabledExtensionCount = 1;
+            ci.ppEnabledExtensionNames = &ext;
+            VkDevice d;
+            VK(vkCreateDevice(g.pd, &ci, nullptr, &d));
+            return d;
+        };
+        vk.instance = g.instance;
+        vk.physicalDevice = g.pd;
+        vk.device = bareDevice();
+        const sl::Result started = slSetVulkanInfo(vk);
+        std::printf("  slSetVulkanInfo with a project id NGX refuses: %d\n", (int)started);
+        if (started == sl::Result::eOk)
+        {
+            std::fprintf(stderr, "NGX started anyway: the case cannot be made here\n");
+            return 2;
+        }
+        SlngxPresenter* a = makePresenter(g, surface, 0);
+        vk.device = bareDevice();
+        slSetVulkanInfo(vk);
+        SlngxPresenterStats st{SLNGX_PRESENTER_VERSION};
+        check(slngxPresenterGetStats(a, &st) == VK_ERROR_DEVICE_LOST,
+            "a new device ends the presenter where NGX did not start on the old one");
+        slngxPresenterDestroy(a);
+        check(validationErrors == 0, "the validation layer reported no error");
+        std::printf("%s: %d check(s) failed\n", failures ? "FAILED" : "PASSED", failures);
+        return failures ? 1 : 0;
+    }
+
     // the device: what the requirements named, each with its feature
     auto has = [&](const char* name) {
         for (auto& e : dext)
@@ -500,7 +559,7 @@ int main(int argc, char** argv)
         return true;
     };
     if (link(fm1, "VK_KHR_swapchain_maintenance1"))
-        fm1.swapchainMaintenance1 = VK_TRUE;
+        fm1.swapchainMaintenance1 = VK_TRUE, g.presenterBits |= SLNGX_DEVICE_SWAPCHAIN_MAINTENANCE1;
     if (link(ft, "VK_EXT_present_timing"))
         ft.presentTiming = VK_TRUE, g.presenterBits |= SLNGX_DEVICE_PRESENT_TIMING;
     if (link(fw2, "VK_KHR_present_wait2"))
@@ -694,8 +753,39 @@ int main(int argc, char** argv)
     // 3. pause, a device-wide wait, resume
     VK(slngxPresenterPause(p));
     check(value(g, run.released) == run.n, "pause: every frame handed over is released");
+    {
+        // paused: a valid frame is not taken (refused before any Vulkan
+        // call, so the release stays ours, unsignalled); a PREINITIALIZED
+        // image is not valid (a barrier cannot bring it back to that layout)
+        FrameSet& s = sets[(run.n + 1) % kSets];
+        SlngxPresentFrame f{SLNGX_PRESENTER_VERSION};
+        f.frame = 1000000;
+        f.real = {s.image[1], kHeld, W, H};
+        f.ready = run.ready;
+        f.readyValue = run.n;
+        f.released = run.released;
+        f.releasedValue = run.n + 1;
+        check(slngxPresent(p, &f, 0) == VK_NOT_READY, "paused: a frame answers VK_NOT_READY");
+        f.real.layout = VK_IMAGE_LAYOUT_PREINITIALIZED;
+        check(slngxPresent(p, &f, 0) == VK_ERROR_INITIALIZATION_FAILED, "a frame in the preinitialized layout is refused");
+        check(value(g, run.released) == run.n, "paused: a refused frame is not released");
+    }
     VK(vkDeviceWaitIdle(g.dev));
     slngxPresenterResume(p);
+    // 3b. pause straight after a frame: the presenter's thread is done with
+    // a frame once it has submitted its copy, which may still run
+    {
+        int missed = 0;
+        for (int i = 0; i < 100; i++)
+        {
+            run.frame(p, true);
+            VK(slngxPresenterPause(p));
+            missed += value(g, run.released) != run.n;
+            slngxPresenterResume(p);
+        }
+        std::printf("  pause straight after a frame: %d of 100 not released at its return\n", missed);
+        check(missed == 0, "pause straight after a frame: the frame is released when it returns");
+    }
     for (int i = 0; i < 30; i++)
         run.frame(p, true);
     // 4. resize
@@ -752,11 +842,42 @@ int main(int argc, char** argv)
         check(rs.lowLatencyAvailable && filled > 0, "slReflexGetState fills frame reports");
     }
     slngxPresenterResume(p);
+    // a hand-over that may not wait, while a frame waits for one never ready
+    {
+        run.frame(p, true, never);
+        run.frame(p, true);
+        const uint64_t timeoutsBefore = run.timeouts;
+        VkResult r = run.frame(p, true, VK_NULL_HANDLE, 0);
+        check(r == VK_TIMEOUT && run.timeouts == timeoutsBefore + 1,
+            "a hand-over with timeout 0 while a frame waits answers VK_TIMEOUT");
+        waitValue(g, run.released, run.n);
+        check(run.frame(p, true) == VK_SUCCESS && stats(p).lastError == VK_SUCCESS,
+            "after a VK_TIMEOUT the next frame is taken");
+    }
     // 6. destroy with frames queued
     run.frame(p, true);
     run.frame(p, true);
     slngxPresenterDestroy(p);
     check(value(g, run.released) == run.n, "destroy: every frame handed over is released");
+
+    // the shown counts come in with no frame after them (GetStats collects
+    // them); the display shows the frames only where the window is on screen
+    if (!all.presentTiming)
+        std::printf("  shown counts: skipped, no present timing on the swapchain\n");
+    else if (all.generatedShown + all.realShown == 0)
+        std::printf("  shown counts: skipped, none in the long run (the window is not on screen)\n");
+    else
+    {
+        p = makePresenter(g, surface, g.presenterBits);
+        run.frame(p, true);
+        VK(slngxPresenterPause(p));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        auto sc = stats(p);
+        print("one frame, then stats", sc);
+        check(sc.generatedShown + sc.realShown > 0, "present timing: the shown counts come in without a next frame");
+        slngxPresenterResume(p);
+        slngxPresenterDestroy(p);
+    }
 
     // 7. without VK_NV_low_latency2: no latency reports
     p = makePresenter(g, surface, g.presenterBits & ~SLNGX_DEVICE_LOW_LATENCY2);
