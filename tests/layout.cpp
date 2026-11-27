@@ -5,11 +5,16 @@
 #include "sl/sl_dlss_d.h"
 #include <vulkan/vulkan.h>
 #include "sl/sl_helpers_vk.h"
+#include "sl/sl_reflex.h"
+#include "sl_ngx/present.h"
 #include <cstddef>
 #include <cstdio>
 
 #define S(t) std::printf("%-24s size %zu align %zu\n", #t, sizeof(sl::t), alignof(sl::t))
 #define F(t, f) std::printf("  %-36s %zu\n", #f, offsetof(sl::t, f))
+// sl-ngx's own (present.h), outside sl::
+#define SC(t) std::printf("%-24s size %zu align %zu\n", #t, sizeof(t), alignof(t))
+#define FC(t, f) std::printf("  %-36s %zu\n", #f, offsetof(t, f))
 
 // a struct's type id (its GUID's 16 bytes as laid out) and the version a
 // default-constructed one carries
@@ -82,9 +87,27 @@ int main()
     F(FeatureRequirements, vkNumOpticalFlowQueuesRequired);
     S(AdapterInfo); F(AdapterInfo, deviceLUID); F(AdapterInfo, deviceLUIDSizeInBytes); F(AdapterInfo, vkPhysicalDevice);
     S(ViewportHandle); S(FeatureVersion);
+    S(ReflexOptions); F(ReflexOptions, mode); F(ReflexOptions, frameLimitUs); F(ReflexOptions, useMarkersToOptimize);
+    F(ReflexOptions, virtualKey); F(ReflexOptions, idThread);
+    SC(SlngxPresenterDesc); FC(SlngxPresenterDesc, version); FC(SlngxPresenterDesc, surface);
+    FC(SlngxPresenterDesc, queueFamily); FC(SlngxPresenterDesc, queueIndex); FC(SlngxPresenterDesc, deviceBits);
+    FC(SlngxPresenterDesc, width); FC(SlngxPresenterDesc, height); FC(SlngxPresenterDesc, format);
+    FC(SlngxPresenterDesc, colorSpace); FC(SlngxPresenterDesc, minImageCount);
+    SC(SlngxPresentImage); FC(SlngxPresentImage, image); FC(SlngxPresentImage, layout);
+    FC(SlngxPresentImage, width); FC(SlngxPresentImage, height);
+    SC(SlngxPresentFrame); FC(SlngxPresentFrame, version); FC(SlngxPresentFrame, frame); FC(SlngxPresentFrame, generated);
+    FC(SlngxPresentFrame, real); FC(SlngxPresentFrame, ready); FC(SlngxPresentFrame, readyValue);
+    FC(SlngxPresentFrame, released); FC(SlngxPresentFrame, releasedValue);
+    SC(SlngxPresenterStats); FC(SlngxPresenterStats, version); FC(SlngxPresenterStats, framesAccepted);
+    FC(SlngxPresenterStats, framesSkipped); FC(SlngxPresenterStats, generatedPresented);
+    FC(SlngxPresenterStats, realPresented); FC(SlngxPresenterStats, generatedShown); FC(SlngxPresenterStats, realShown);
+    FC(SlngxPresenterStats, presentTiming); FC(SlngxPresenterStats, lowLatency); FC(SlngxPresenterStats, latencyReports);
+    FC(SlngxPresenterStats, swapchainsMade); FC(SlngxPresenterStats, width); FC(SlngxPresenterStats, height);
+    FC(SlngxPresenterStats, copyGpuMs); FC(SlngxPresenterStats, intervalMs); FC(SlngxPresenterStats, presentHalfMs);
+    FC(SlngxPresenterStats, lastError); FC(SlngxPresenterStats, deviceLost);
     std::printf("kSDKVersion %#llx\n", (unsigned long long)sl::kSDKVersion);
     ID(Preferences); ID(VulkanInfo); ID(FeatureRequirements); ID(Resource); ID(ResourceTag); ID(Constants);
     ID(DLSSOptions); ID(DLSSOptimalSettings); ID(DLSSState); ID(DLSSDOptions); ID(DLSSDOptimalSettings);
-    ID(DLSSDState); ID(ViewportHandle); ID(AdapterInfo); ID(FeatureVersion);
+    ID(DLSSDState); ID(ViewportHandle); ID(AdapterInfo); ID(FeatureVersion); ID(ReflexOptions);
     return 0;
 }
