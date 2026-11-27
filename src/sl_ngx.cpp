@@ -639,23 +639,34 @@ Result requirementsFor(sl::Feature feature)
     };
     if (feature == sl::kFeatureDLSS_G)
     {
-        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_NV_LOW_LATENCY_2_EXTENSION_NAME, "VK_KHR_present_id2",
-            "VK_KHR_present_wait2", "VK_KHR_swapchain_maintenance1"});
+        // names, not the headers' macros: the presenter leaves out what the
+        // headers it was built with lack, and asks only for what it uses
+        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, "VK_KHR_swapchain_maintenance1"});
+#if defined(VK_NV_low_latency2)
+        addIfDevice({"VK_NV_low_latency2"});
+#endif
+#if defined(VK_KHR_present_id2)
+        addIfDevice({"VK_KHR_present_id2", "VK_KHR_present_wait2"});
+#endif
+#if defined(VK_EXT_present_timing) && defined(VK_KHR_present_id2)
         // present timing (the shown counts) needs calibrated timestamps beside it
         if (pd && slngx::deviceHasExtension(pd, "VK_EXT_present_timing") &&
             slngx::deviceHasExtension(pd, "VK_KHR_present_id2") &&
-            slngx::deviceHasExtension(pd, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+            slngx::deviceHasExtension(pd, "VK_KHR_calibrated_timestamps"))
         {
-            add(dev, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            add(dev, "VK_KHR_calibrated_timestamps");
             add(dev, "VK_EXT_present_timing");
         }
-        for (auto n : {VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, "VK_KHR_surface_maintenance1"})
+#endif
+        for (auto n : {"VK_KHR_get_surface_capabilities2", "VK_KHR_surface_maintenance1"})
             if (slngx::instanceHasExtension(n))
                 add(inst, n);
     }
     if (latency(feature))
     {
-        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_NV_LOW_LATENCY_2_EXTENSION_NAME});
+#if defined(VK_NV_low_latency2)
+        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, "VK_NV_low_latency2"});
+#endif
     }
     else
     {
@@ -1070,7 +1081,8 @@ SL_NGX_EXPORT Result slSetVulkanInfo(const sl::VulkanInfo& info)
         return Result::eOk;
     if (g.started)
     {
-        slngx::endPresenter();
+        // the old device may be lost: no call on it, as for NGX
+        slngx::abandonPresenter();
         abandonNgx();
     }
     g.instance = info.instance;
@@ -1086,11 +1098,15 @@ SL_NGX_EXPORT Result slIsFeatureSupported(sl::Feature feature, const sl::Adapter
         return Result::eErrorInitNotCalled;
     if (latency(feature))
     {
-        const VkPhysicalDevice pd = g.physicalDevice ? g.physicalDevice : g.queryPhysicalDevice;
+#if defined(VK_NV_low_latency2)
+        VkPhysicalDevice pd = adapter.vkPhysicalDevice ? (VkPhysicalDevice)adapter.vkPhysicalDevice
+                                                       : (g.physicalDevice ? g.physicalDevice : g.queryPhysicalDevice);
         if (!pd)
             return Result::eErrorDeviceNotCreated;
-        return slngx::deviceHasExtension(pd, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) ? Result::eOk
-                                                                                 : Result::eErrorFeatureNotSupported;
+        return slngx::deviceHasExtension(pd, "VK_NV_low_latency2") ? Result::eOk : Result::eErrorFeatureNotSupported;
+#else
+        return Result::eErrorFeatureNotSupported; // built without VK_NV_low_latency2
+#endif
     }
     if (!ours(feature))
         return Result::eErrorFeatureMissing;

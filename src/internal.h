@@ -31,7 +31,11 @@ sl::Result pclSetMarker(sl::PCLMarker marker, const sl::FrameToken& frame);
 bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name);
 bool instanceHasExtension(const char* name);
 
-// A presenter left running at slShutdown or on a replaced device.
+// A presenter left running at slShutdown: stopped and its Vulkan objects
+// destroyed (the device still works).
 void endPresenter();
+// A presenter left running on a replaced device: stopped without a Vulkan
+// call or a join (the old device may be lost); its objects leak there.
+void abandonPresenter();
 
 } // namespace slngx
