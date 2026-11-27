@@ -157,6 +157,56 @@ AdapterInfo              size 56 align 8
   vkPhysicalDevice                     48
 ViewportHandle           size 40 align 8
 FeatureVersion           size 56 align 8
+ReflexOptions            size 48 align 8
+  mode                                 32
+  frameLimitUs                         36
+  useMarkersToOptimize                 40
+  virtualKey                           42
+  idThread                             44
+SlngxPresenterDesc       size 48 align 8
+  version                              0
+  surface                              8
+  queueFamily                          16
+  queueIndex                           20
+  deviceBits                           24
+  width                                28
+  height                               32
+  format                               36
+  colorSpace                           40
+  minImageCount                        44
+SlngxPresentImage        size 24 align 8
+  image                                0
+  layout                               8
+  width                                12
+  height                               16
+SlngxPresentFrame        size 88 align 8
+  version                              0
+  frame                                4
+  generated                            8
+  real                                 32
+  ready                                56
+  readyValue                           64
+  released                             72
+  releasedValue                        80
+SlngxPresenterStats      size 104 align 8
+  version                              0
+  framesAccepted                       8
+  framesSkipped                        16
+  generatedPresented                   24
+  realPresented                        32
+  generatedShown                       40
+  realShown                            48
+  presentTiming                        56
+  lowLatency                           60
+  latencyReports                       64
+  swapchainsMade                       68
+  width                                72
+  height                               76
+  copyGpuMs                            80
+  intervalMs                           84
+  presentHalfMs                        88
+  lastError                            92
+  deviceLost                           96
 kSDKVersion 0x2000e0010fedc
 Preferences              id 65 09 a1 1c 8e bf 2b 43 8d a1 67 16 d8 79 fb 14 version 1
 VulkanInfo               id d5 6f ed 0e cd 82 a9 43 bd b5 47 a5 ba 2f 45 d6 version 3
@@ -173,3 +223,4 @@ DLSSDState               id 14 3c 87 71 ca f8 67 47 9e af 3b 43 93 ea 98 fa vers
 ViewportHandle           id 35 64 1b 17 3c 9b c8 4f 99 94 fb e5 25 69 aa a4 version 1
 AdapterInfo              id 5f 31 77 06 46 a7 92 44 9f 42 cb 61 42 c9 c3 d4 version 1
 FeatureVersion           id f0 51 5b 6d 6b 07 6d 48 99 95 5a 56 10 43 f5 c1 version 1
+ReflexOptions            id 1a f8 3a f0 0b 6d 02 49 a6 51 c4 96 5e 21 54 34 version 1
