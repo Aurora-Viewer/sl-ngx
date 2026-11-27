@@ -28,7 +28,10 @@ allows it.
 ## Build
 
 You need g++, make, the Vulkan headers and loader, and the
-[NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS).
+[NVIDIA DLSS SDK](https://github.com/NVIDIA/DLSS). The library builds
+with older Vulkan headers too (`tests/present` needs current ones): the presenter's parts that need `VK_NV_low_latency2`,
+`VK_KHR_present_id2` or `VK_EXT_present_timing` are left out where the
+headers lack them (without `VK_NV_low_latency2`, no Reflex or PCL).
 
 ```bash
 make DLSS_SDK=/path/to/DLSS
@@ -110,11 +113,17 @@ Differences from Streamline:
   them; the application enables each with its feature
   (`presentId`, `presentId2`, `presentWait2`, `presentTiming`,
   `swapchainMaintenance1`) and says which in `SlngxPresenterDesc::deviceBits`.
+  `presentId2` and `presentTiming` are used where the surface supports them;
+  `presentWait2` is not used yet. The calling contract (queue families,
+  formats, frame numbers, error codes) is in `present.h`.
 - Reflex and PCL need the presenter: they use `VK_NV_low_latency2` on its
   swapchain, with the present id `2 × frame + 2` (the rendered frame's
   present), and do nothing without one. `slReflexSleep` returns at once
   while Reflex is off with no frame limit. `ReflexOptions::frameLimitUs`
-  becomes the swapchain's minimum frame interval.
+  becomes the swapchain's minimum frame interval, which the driver applies
+  per rendered frame (between Reflex sleeps), not per present:
+  `tests/present` measures 100 ms rendered frames with both frames of each
+  presented.
 - `slSetVulkanInfo` may be called with an instance and physical device but no
   device. `slGetFeatureRequirements` then also reports the device extensions
   NGX needs on that device, so the application can create its device with
