@@ -2,3 +2,4 @@
 *.o
 tests/layout
 tests/smoke
+tests/present
