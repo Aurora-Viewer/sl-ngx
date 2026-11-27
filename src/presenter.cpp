@@ -51,6 +51,10 @@
 #if defined(VK_EXT_present_timing) && defined(VK_KHR_present_id2)
 #define SLNGX_HAVE_TIMING 1
 #endif
+// present fences (the EXT names, which both header generations have)
+#if defined(VK_EXT_swapchain_maintenance1)
+#define SLNGX_HAVE_M1 1
+#endif
 
 using sl::Result;
 
@@ -73,6 +77,11 @@ struct Slot
     VkSemaphore acquired[2]{};
     VkFence fence = VK_NULL_HANDLE;
     bool timed[2]{};
+    // with present fences (maint1): what each half's last present signals
+    // once the presentation engine is done with its semaphore, and whether
+    // that present is outstanding
+    VkFence presented[2]{};
+    bool presentPending[2]{};
 };
 
 // Reflex's options, kept for every swapchain the presenter makes.
@@ -89,7 +98,7 @@ struct SlngxPresenter
     VkQueue queue = VK_NULL_HANDLE;
     SlngxPresenterDesc desc{};
     // what the device has, from the device bits
-    bool lowLatency = false, id2 = false, timing = false;
+    bool lowLatency = false, id2 = false, timing = false, maint1 = false;
 
     PFN_vkGetPhysicalDeviceSurfaceCapabilities2KHR surfaceCaps2 = nullptr;
 #if SLNGX_HAVE_LL2
@@ -106,18 +115,23 @@ struct SlngxPresenter
 #endif
 
     // The swapchain: made and destroyed on the presenter's thread (or by
-    // Destroy once it has stopped); the application's thread (Reflex)
-    // reads it under swapLock.
+    // Destroy once it has stopped); the application's thread (Reflex,
+    // slngxPresenterGetStats) reads it under swapLock. Lock order: gp,
+    // swapLock, gReflexLock; m is never held while swapLock is taken.
     std::mutex swapLock;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> images;
     std::vector<VkSemaphore> copied;
     uint32_t width = 0, height = 0;
-    // what the surface allows on this swapchain (presenter's thread)
+    // what the surface allows on this swapchain (presenter's thread;
+    // swapTiming written under swapLock, which countShown reads it under)
     bool swapId2 = false, swapTiming = false;
     uint64_t timeDomainId = 0;
-    uint32_t timingStage = 0;   // VkPresentStageFlagsEXT queried
-    uint32_t timingPending = 0; // presents whose timing is not reported complete yet
+    uint32_t timingStage = 0; // VkPresentStageFlagsEXT queried
+    // presents whose timing is not reported complete yet: changed under
+    // swapLock; the presenter's thread reads it without (only countShown,
+    // under swapLock, lowers it)
+    std::atomic<uint32_t> timingPending{0};
     uint64_t lastRealId = 0;    // the last rendered frame's present id
     bool idWarned = false, suboptimalRemade = false;
 
@@ -217,17 +231,49 @@ void destroySwapchainParts(SlngxPresenter* p, VkSwapchainKHR sc, std::vector<VkS
         vkDestroySwapchainKHR(p->dev, sc, nullptr);
 }
 
-// Destroys a swapchain taken out of p->swapchain, once a Reflex sleep the
-// application issued on it is over (at most kSleepTimeoutNs).
+// With present fences (maint1): waits until the presentation engine is
+// done with every present made so far, at most kReadyTimeoutNs. Without
+// them VK_KHR_swapchain gives no such signal, and the vkQueueWaitIdle
+// before a swapchain is destroyed is all there is (the usual practice).
+VkResult waitPresented(SlngxPresenter* p)
+{
+    VkFence fences[kSlots * 2];
+    uint32_t n = 0;
+    for (auto& s : p->slots)
+        for (int h = 0; h < 2; h++)
+            if (s.presentPending[h])
+                fences[n++] = s.presented[h];
+    if (!n)
+        return VK_SUCCESS;
+    VkResult r = vkWaitForFences(p->dev, n, fences, VK_TRUE, kReadyTimeoutNs);
+    if (r == VK_SUCCESS)
+        for (auto& s : p->slots)
+            s.presentPending[0] = s.presentPending[1] = false;
+    return r;
+}
+
+// Destroys a swapchain taken out of p->swapchain (a retired one: it was the
+// oldSwapchain of the one made after it), once the presentation engine is
+// done with its presents and a Reflex sleep the application issued on it
+// is over. Where either is not known to be over, it is left undestroyed:
+// a retired swapchain holds no surface.
 void retire(SlngxPresenter* p, VkSwapchainKHR sc, std::vector<VkSemaphore>& sems, uint64_t sleepValue)
 {
-    if (sc && p->sleepSem && sleepValue)
+    VkResult r = sc ? waitPresented(p) : VK_SUCCESS;
+    if (sc && r == VK_SUCCESS && p->sleepSem && sleepValue)
     {
         VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
         wi.semaphoreCount = 1;
         wi.pSemaphores = &p->sleepSem;
         wi.pValues = &sleepValue;
-        vkWaitSemaphores(p->dev, &wi, kSleepTimeoutNs);
+        r = vkWaitSemaphores(p->dev, &wi, kSleepTimeoutNs);
+    }
+    // a lost device's objects may be destroyed whatever is pending
+    if (r != VK_SUCCESS && r != VK_ERROR_DEVICE_LOST)
+    {
+        PLOG_WARN("sl-ngx presenter: an old swapchain is still in use (%d): left undestroyed", r);
+        sems.clear();
+        return;
     }
     destroySwapchainParts(p, sc, sems);
 }
@@ -246,9 +292,10 @@ void dropSwapchain(SlngxPresenter* p)
         p->swapchain = VK_NULL_HANDLE;
         p->images.clear();
         sleepValue = p->sleepValue;
+        p->swapTiming = false;
+        p->timingPending = 0;
     }
-    p->swapId2 = p->swapTiming = false;
-    p->timingPending = 0;
+    p->swapId2 = false;
     retire(p, old, sems, sleepValue);
 }
 
@@ -419,11 +466,11 @@ VkResult makeSwapchain(SlngxPresenter* p)
 #endif
         sleepValue = p->sleepValue;
         applySleepMode(p);
+        p->swapTiming = swapTiming;
+        p->timingPending = 0;
     }
     p->swapId2 = id2;
-    p->swapTiming = swapTiming;
     p->timingStage = stage;
-    p->timingPending = 0;
     // lastRealId stays: a swapchain made between a frame's two presents
     // gets that frame's ids, so ids increase across swapchains too
     retire(p, old, oldSems, sleepValue);
@@ -460,52 +507,54 @@ void readTimestamps(SlngxPresenter* p, uint32_t slot)
 }
 
 // Counts the frames present timing reports shown, and frees their slots in
-// the swapchain's timing queue (only complete reports free one).
+// the swapchain's timing queue (only complete reports free one). From the
+// presenter's thread before each frame, and from slngxPresenterGetStats,
+// so that the counts also come in while no frame follows.
 void countShown(SlngxPresenter* p)
 {
 #if SLNGX_HAVE_TIMING
-    if (!p->swapTiming || !p->pastTiming || !p->timingPending)
+    if (!p->pastTiming)
         return;
     VkPastPresentationTimingEXT pt[kTimingQueue];
     VkPresentStageTimeEXT st[kTimingQueue];
     uint64_t generated = 0, real = 0;
-    uint32_t complete = 0;
-    for (int round = 0; round < 4; round++)
     {
-        for (uint32_t i = 0; i < kTimingQueue; i++)
+        // the swapchain is externally synchronised here too, and its
+        // timing state is the presenter thread's and this caller's both
+        std::lock_guard<std::mutex> l(p->swapLock);
+        if (!p->swapchain || !p->swapTiming || !p->timingPending)
+            return;
+        uint32_t complete = 0;
+        for (int round = 0; round < 4; round++)
         {
-            pt[i] = VkPastPresentationTimingEXT{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT};
-            pt[i].presentStageCount = 1;
-            pt[i].pPresentStages = &st[i];
-        }
-        VkPastPresentationTimingInfoEXT info{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
-        info.flags = VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
-        VkPastPresentationTimingPropertiesEXT props{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
-        props.presentationTimingCount = kTimingQueue;
-        props.pPresentationTimings = pt;
-        VkResult r;
-        {
-            // the swapchain is externally synchronised here too
-            std::lock_guard<std::mutex> l(p->swapLock);
-            if (!p->swapchain)
-                break;
+            for (uint32_t i = 0; i < kTimingQueue; i++)
+            {
+                pt[i] = VkPastPresentationTimingEXT{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_EXT};
+                pt[i].presentStageCount = 1;
+                pt[i].pPresentStages = &st[i];
+            }
+            VkPastPresentationTimingInfoEXT info{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_INFO_EXT};
+            info.flags = VK_PAST_PRESENTATION_TIMING_ALLOW_OUT_OF_ORDER_RESULTS_BIT_EXT;
             info.swapchain = p->swapchain;
-            r = p->pastTiming(p->dev, &info, &props);
+            VkPastPresentationTimingPropertiesEXT props{VK_STRUCTURE_TYPE_PAST_PRESENTATION_TIMING_PROPERTIES_EXT};
+            props.presentationTimingCount = kTimingQueue;
+            props.pPresentationTimings = pt;
+            VkResult r = p->pastTiming(p->dev, &info, &props);
+            if (r != VK_SUCCESS && r != VK_INCOMPLETE)
+                break;
+            for (uint32_t i = 0; i < props.presentationTimingCount; i++)
+            {
+                if (!pt[i].reportComplete)
+                    continue;
+                complete++;
+                if (pt[i].presentStageCount && st[i].time)
+                    (pt[i].presentId & 1 ? generated : real)++;
+            }
+            if (r == VK_SUCCESS)
+                break;
         }
-        if (r != VK_SUCCESS && r != VK_INCOMPLETE)
-            break;
-        for (uint32_t i = 0; i < props.presentationTimingCount; i++)
-        {
-            if (!pt[i].reportComplete)
-                continue;
-            complete++;
-            if (pt[i].presentStageCount && st[i].time)
-                (pt[i].presentId & 1 ? generated : real)++;
-        }
-        if (r == VK_SUCCESS)
-            break;
+        p->timingPending -= std::min(complete, p->timingPending.load());
     }
-    p->timingPending -= std::min(complete, p->timingPending);
     if (!generated && !real)
         return;
     std::lock_guard<std::mutex> l(p->m);
@@ -599,6 +648,15 @@ void fail(SlngxPresenter* p, VkResult r)
     p->stats.lastError = r;
 }
 
+// The results a frame may stop on with the presenter going on: a late
+// image or report (VK_TIMEOUT), a minimised window (VK_NOT_READY), a
+// swapchain to remake (VK_ERROR_OUT_OF_DATE_KHR, VK_SUBOPTIMAL_KHR). Any
+// other error stops the presenter.
+bool transient(VkResult r)
+{
+    return r >= 0 || r == VK_ERROR_OUT_OF_DATE_KHR;
+}
+
 // Copies one image into a swapchain image and presents it. `last`: the
 // frame's final submit, which signals `released` and the slot's fence;
 // `releaseSubmitted` tells whether that submit went in.
@@ -606,6 +664,24 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
     uint64_t markerId, const SlngxPresentFrame* last, bool& releaseSubmitted)
 {
     Slot& s = p->slots[slot];
+    if (s.presentPending[h])
+    {
+        // this half's present fence, before anything is acquired: a late
+        // one leaves nothing pending behind it
+        VkResult w = vkWaitForFences(p->dev, 1, &s.presented[h], VK_TRUE, kReadyTimeoutNs);
+        if (w != VK_SUCCESS)
+            return w;
+        s.presentPending[h] = false;
+    }
+    if (s.presented[h])
+    {
+        VkResult w = vkResetFences(p->dev, 1, &s.presented[h]);
+        if (w != VK_SUCCESS)
+        {
+            fail(p, w);
+            return w;
+        }
+    }
     uint32_t index = 0;
     VkResult r = VK_ERROR_OUT_OF_DATE_KHR;
     for (int attempt = 0; attempt < 2 && r == VK_ERROR_OUT_OF_DATE_KHR; attempt++)
@@ -628,11 +704,19 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
     else if (r != VK_SUCCESS)
         return r;
 
+    // from here on a failure leaves the acquired image and its semaphore
+    // pending: the presenter cannot go on with this swapchain's sync objects
     VkCommandBuffer cb = s.cb[h];
-    vkResetCommandBuffer(cb, 0);
+    r = vkResetCommandBuffer(cb, 0);
     VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    vkBeginCommandBuffer(cb, &bi);
+    if (r == VK_SUCCESS)
+        r = vkBeginCommandBuffer(cb, &bi);
+    if (r != VK_SUCCESS)
+    {
+        fail(p, r);
+        return r;
+    }
     if (p->queries)
     {
         vkCmdResetQueryPool(cb, p->queries, slot * 4 + h * 2, 2);
@@ -661,7 +745,12 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
             VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT);
     if (p->queries)
         vkCmdWriteTimestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, p->queries, slot * 4 + h * 2 + 1);
-    vkEndCommandBuffer(cb);
+    r = vkEndCommandBuffer(cb);
+    if (r != VK_SUCCESS)
+    {
+        fail(p, r);
+        return r;
+    }
 
     VkSemaphore signals[2] = {p->copied[index], last ? last->released : VK_NULL_HANDLE};
     uint64_t signalValues[2] = {0, last ? last->releasedValue : 0};
@@ -680,12 +769,11 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
     si.signalSemaphoreCount = nSignals;
     si.pSignalSemaphores = signals;
     if (last)
-        vkResetFences(p->dev, 1, &s.fence);
-    r = vkQueueSubmit(p->queue, 1, &si, last ? s.fence : VK_NULL_HANDLE);
+        r = vkResetFences(p->dev, 1, &s.fence);
+    if (r == VK_SUCCESS)
+        r = vkQueueSubmit(p->queue, 1, &si, last ? s.fence : VK_NULL_HANDLE);
     if (r != VK_SUCCESS)
     {
-        // the acquired image and its semaphore are left pending: the
-        // presenter cannot go on with this swapchain's sync objects
         fail(p, r);
         return r;
     }
@@ -724,6 +812,13 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
         pid1.pNext = chain, chain = &pid1;
 #endif
     (void)idChained;
+#if SLNGX_HAVE_M1
+    VkSwapchainPresentFenceInfoEXT pf{VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_EXT};
+    pf.swapchainCount = 1;
+    pf.pFences = &s.presented[h];
+    if (s.presented[h])
+        pf.pNext = chain, chain = &pf;
+#endif
     VkPresentInfoKHR pi{VK_STRUCTURE_TYPE_PRESENT_INFO_KHR};
     pi.pNext = chain;
     pi.waitSemaphoreCount = 1;
@@ -744,10 +839,15 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
 #if SLNGX_HAVE_LL2
         marker(p, VK_LATENCY_MARKER_OUT_OF_BAND_PRESENT_END_NV, markerId);
 #endif
+        if ((r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && timed)
+            p->timingPending++;
     }
     (void)markerId;
-    if ((r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) && timed)
-        p->timingPending++;
+    // a present the presentation engine rejected with these is enqueued all
+    // the same (VK_KHR_swapchain_maintenance1), and signals its fence
+    s.presentPending[h] = s.presented[h] &&
+        (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR || r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_ERROR_SURFACE_LOST_KHR ||
+            r == VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT);
     bool shown = r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR;
     if (r == VK_SUBOPTIMAL_KHR)
     {
@@ -783,13 +883,13 @@ VkResult presentOne(SlngxPresenter* p, uint32_t slot, int h, const SlngxPresentI
 void stopOnError(SlngxPresenter* p, VkResult r, const SlngxPresentFrame& f)
 {
     PLOG_ERROR("sl-ngx presenter: frame %u -> %d", f.frame, r);
+    if (!transient(r))
+    {
+        fail(p, r); // a lost surface, no memory, a lost device: slngxPresent answers it
+        return;
+    }
     std::lock_guard<std::mutex> l(p->m);
     p->stats.lastError = r;
-    if (r == VK_ERROR_DEVICE_LOST)
-    {
-        p->lost = true;
-        p->stats.deviceLost = 1;
-    }
 }
 
 // The frame is not presented: release it (unless its final submit already
@@ -958,21 +1058,29 @@ void run(SlngxPresenter* p)
     }
 }
 
-// Releases what is still queued; the presenter's thread is idle or gone.
-void drain(SlngxPresenter* p, std::unique_lock<std::mutex>& l)
+// Waits for the presenter's queue (the copies of the frames it took, and
+// their release, may still run there) and releases what is still queued;
+// the presenter's thread is idle or gone. A failed wait stops the
+// presenter, and the frames still queued stay unreleased.
+VkResult drain(SlngxPresenter* p, std::unique_lock<std::mutex>& l)
 {
     std::deque<SlngxPresentFrame> left;
     left.swap(p->queued);
     const bool lost = p->lost;
     l.unlock();
-    if (!lost && !left.empty())
+    VkResult r = VK_SUCCESS;
+    if (!lost && p->queue)
     {
-        vkQueueWaitIdle(p->queue);
-        for (auto& f : left)
-            hostRelease(p, f);
+        r = vkQueueWaitIdle(p->queue);
+        if (r != VK_SUCCESS)
+            fail(p, r);
+        else
+            for (auto& f : left)
+                hostRelease(p, f);
     }
     l.lock();
     p->stats.framesSkipped += left.size();
+    return r;
 }
 
 // Stops the thread, releases what is queued and destroys the presenter's
@@ -997,6 +1105,17 @@ void teardown(SlngxPresenter* p)
     }
     if (p->queue)
         vkQueueWaitIdle(p->queue);
+    // the presentation engine's use of the present semaphores: known over
+    // with present fences only (waitPresented). Where they do not signal,
+    // the semaphores and fences are left, and the swapchain is destroyed
+    // all the same, so that the surface is the application's again.
+    const VkResult presented = waitPresented(p);
+    const bool presentsOver = presented == VK_SUCCESS || presented == VK_ERROR_DEVICE_LOST;
+    if (!presentsOver)
+    {
+        PLOG_WARN("sl-ngx presenter: presents still outstanding at the end (%d): their semaphores left", presented);
+        p->copied.clear();
+    }
     destroySwapchainParts(p, p->swapchain, p->copied);
     p->swapchain = VK_NULL_HANDLE;
     for (auto& s : p->slots)
@@ -1006,6 +1125,9 @@ void teardown(SlngxPresenter* p)
                 vkDestroySemaphore(p->dev, sem, nullptr);
         if (s.fence)
             vkDestroyFence(p->dev, s.fence, nullptr);
+        for (int h = 0; h < 2; h++)
+            if (s.presented[h] && (presentsOver || !s.presentPending[h]))
+                vkDestroyFence(p->dev, s.presented[h], nullptr);
         s = Slot{};
     }
     if (p->queries)
@@ -1013,7 +1135,26 @@ void teardown(SlngxPresenter* p)
     if (p->pool)
         vkDestroyCommandPool(p->dev, p->pool, nullptr);
     if (p->sleepSem)
-        vkDestroySemaphore(p->dev, p->sleepSem, nullptr);
+    {
+        // every Reflex sleep is over (gSleepers), but one may have stopped
+        // waiting before the driver signalled (the presenter was ended
+        // meanwhile): the semaphore is destroyed once that signal came, or
+        // left
+        uint64_t reached = 0;
+        VkResult r = vkGetSemaphoreCounterValue(p->dev, p->sleepSem, &reached);
+        if (r == VK_SUCCESS && reached < p->sleepValue)
+        {
+            VkSemaphoreWaitInfo wi{VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO};
+            wi.semaphoreCount = 1;
+            wi.pSemaphores = &p->sleepSem;
+            wi.pValues = &p->sleepValue;
+            r = vkWaitSemaphores(p->dev, &wi, kReadyTimeoutNs);
+        }
+        if (r == VK_SUCCESS || r == VK_ERROR_DEVICE_LOST)
+            vkDestroySemaphore(p->dev, p->sleepSem, nullptr);
+        else
+            PLOG_WARN("sl-ngx presenter: a Reflex sleep still pending at the end (%d): its semaphore left", r);
+    }
     p->queries = VK_NULL_HANDLE;
     p->pool = VK_NULL_HANDLE;
     p->sleepSem = VK_NULL_HANDLE;
@@ -1047,9 +1188,10 @@ sl::Result reflexSleep(const sl::FrameToken&)
     VkDevice dev;
     VkSemaphore sem;
     uint64_t value;
+    SlngxPresenter* self;
     {
         std::lock_guard<std::mutex> l(gp);
-        SlngxPresenter* p = gPresenter;
+        SlngxPresenter* p = self = gPresenter;
         if (!p || !p->lowLatency || !p->latencySleep)
             return Result::eOk;
         {
@@ -1075,7 +1217,20 @@ sl::Result reflexSleep(const sl::FrameToken&)
     wi.semaphoreCount = 1;
     wi.pSemaphores = &sem;
     wi.pValues = &value;
-    vkWaitSemaphores(dev, &wi, kSleepTimeoutNs);
+    for (;;)
+    {
+        // a wakeup further off than one wait (a long frame limit) is waited
+        // for: the semaphore and the swapchain stay while a signal is due.
+        // A presenter ended meanwhile (slShutdown, a new device) is not
+        // waited on: teardown checks the semaphore before destroying it,
+        // and a replaced device's objects are left as they are.
+        VkResult r = vkWaitSemaphores(dev, &wi, kSleepTimeoutNs);
+        if (r != VK_TIMEOUT)
+            break;
+        std::lock_guard<std::mutex> l(gp);
+        if (gPresenter != self)
+            break;
+    }
     {
         std::lock_guard<std::mutex> l(gp);
         gSleepers--;
@@ -1298,6 +1453,9 @@ SL_NGX_EXPORT VkResult slngxPresenterCreate(const SlngxPresenterDesc* desc, Slng
 #if SLNGX_HAVE_TIMING
     p->timing = (desc->deviceBits & SLNGX_DEVICE_PRESENT_TIMING) && p->id2;
 #endif
+#if SLNGX_HAVE_M1
+    p->maint1 = desc->deviceBits & SLNGX_DEVICE_SWAPCHAIN_MAINTENANCE1;
+#endif
     if (p->id2)
     {
         // the device extensions need VK_KHR_get_surface_capabilities2 on the instance
@@ -1350,6 +1508,10 @@ SL_NGX_EXPORT VkResult slngxPresenterCreate(const SlngxPresenterDesc* desc, Slng
         fci.flags = VK_FENCE_CREATE_SIGNALED_BIT;
         if (r == VK_SUCCESS)
             r = vkCreateFence(p->dev, &fci, nullptr, &s.fence);
+        VkFenceCreateInfo pfci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        for (auto& f : s.presented)
+            if (r == VK_SUCCESS && p->maint1)
+                r = vkCreateFence(p->dev, &pfci, nullptr, &f);
     }
     VkSemaphoreTypeCreateInfo tci{VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO};
     tci.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
@@ -1402,7 +1564,10 @@ namespace
 
 bool validImage(const SlngxPresentImage& i)
 {
-    return i.image && i.width && i.height && i.layout != VK_IMAGE_LAYOUT_UNDEFINED;
+    // the presenter leaves the image in its layout: a barrier can go to
+    // neither of these
+    return i.image && i.width && i.height && i.layout != VK_IMAGE_LAYOUT_UNDEFINED &&
+        i.layout != VK_IMAGE_LAYOUT_PREINITIALIZED;
 }
 
 } // namespace
@@ -1461,8 +1626,9 @@ SL_NGX_EXPORT VkResult slngxPresenterPause(SlngxPresenter* p)
     p->paused = true;
     p->cv.notify_all();
     p->cv.wait(l, [&] { return !p->busy; });
-    drain(p, l);
-    return p->lost ? VK_ERROR_DEVICE_LOST : VK_SUCCESS;
+    // always: the thread is done once it has submitted, not once the GPU is
+    const VkResult r = drain(p, l);
+    return p->lost ? VK_ERROR_DEVICE_LOST : r;
 }
 
 SL_NGX_EXPORT void slngxPresenterResume(SlngxPresenter* p)
@@ -1499,7 +1665,12 @@ SL_NGX_EXPORT void slngxPresenterDestroy(SlngxPresenter* p)
     else if (ended)
     {
         // ended under the application: its Vulkan objects are destroyed
-        // already, or were left on a replaced device; only its thread may remain
+        // already, or were left on a replaced device; only its thread may
+        // remain, and a Reflex sleep may still wait on that device
+        {
+            std::unique_lock<std::mutex> l(gp);
+            gpCv.wait(l, [] { return gSleepers == 0; });
+        }
         if (p->thread.joinable())
             p->thread.join();
         delete p;
@@ -1525,6 +1696,7 @@ SL_NGX_EXPORT VkResult slngxPresenterGetStats(SlngxPresenter* p, SlngxPresenterS
         }
     }
 #endif
+    countShown(p);
     std::lock_guard<std::mutex> l(p->m);
     *out = p->stats;
     out->latencyReports = reports;
