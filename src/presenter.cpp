@@ -117,7 +117,8 @@ struct SlngxPresenter
     // The swapchain: made and destroyed on the presenter's thread (or by
     // Destroy once it has stopped); the application's thread (Reflex,
     // slngxPresenterGetStats) reads it under swapLock. Lock order: gp,
-    // swapLock, gReflexLock; m is never held while swapLock is taken.
+    // swapLock, gReflexLock; m is never held while swapLock or gp is
+    // taken (a Reflex sleep takes m under gp).
     std::mutex swapLock;
     VkSwapchainKHR swapchain = VK_NULL_HANDLE;
     std::vector<VkImage> images;
@@ -1223,12 +1224,17 @@ sl::Result reflexSleep(const sl::FrameToken&)
         // for: the semaphore and the swapchain stay while a signal is due.
         // A presenter ended meanwhile (slShutdown, a new device) is not
         // waited on: teardown checks the semaphore before destroying it,
-        // and a replaced device's objects are left as they are.
+        // and a replaced device's objects are left as they are. Nor is a
+        // stopped one (a lost surface may never signal): the application
+        // learns of it at its next frame and destroys it.
         VkResult r = vkWaitSemaphores(dev, &wi, kSleepTimeoutNs);
         if (r != VK_TIMEOUT)
             break;
-        std::lock_guard<std::mutex> l(gp);
+        std::lock_guard<std::mutex> l(gp); // gp, then m (the lock order)
         if (gPresenter != self)
+            break;
+        std::lock_guard<std::mutex> m(self->m);
+        if (self->lost || self->failed != VK_SUCCESS)
             break;
     }
     {
