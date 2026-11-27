@@ -12,10 +12,12 @@ written against Streamline's headers can use DLSS on Linux.
 
 ## What is in this repository
 
-- `include/sl/`: twelve of Streamline's public headers (v2.14.16), unchanged,
+- `include/sl/`: fourteen of Streamline's public headers (v2.14.16), unchanged,
   under NVIDIA's MIT licence (`include/sl/LICENSE-Streamline.txt`).
-- `src/sl_ngx.cpp`: the implementation, MIT (`LICENSE`).
-- `tests/`: a struct layout probe, export and source checks, and a GPU smoke test.
+- `include/sl_ngx/present.h`: sl-ngx's own presenter for frame generation, MIT.
+- `src/`: the implementation, MIT (`LICENSE`).
+- `tests/`: a struct layout probe, export and source checks, a GPU smoke test
+  and a presenter test.
 
 Nothing of the NVIDIA DLSS SDK is in this repository. You build the library
 against your own copy of the SDK, which you download from NVIDIA and use
@@ -56,6 +58,15 @@ tests/smoke /folder/with/the/models abandon  # DLSS again on a second device
 tests/smoke /folder/with/the/models fg     # Frame Generation
 ```
 
+The presenter test needs SDL3 and opens a window; with the Vulkan
+validation layer installed it runs under synchronisation and thread-safety
+validation and fails on any error:
+
+```bash
+make tests/present-build DLSS_SDK=/path/to/DLSS
+tests/present
+```
+
 ## What is implemented
 
 `slInit`, `slShutdown`, `slSetVulkanInfo`, `slGetFeatureRequirements`,
@@ -66,12 +77,14 @@ tests/smoke /folder/with/the/models fg     # Frame Generation
 below). Through `slGetFeatureFunction`:
 `slDLSSGetOptimalSettings`, `slDLSSGetState`, `slDLSSSetOptions` and their
 `slDLSSD*` counterparts, so the inline helpers in `sl_dlss.h` and
-`sl_dlss_d.h` work as they do with Streamline.
+`sl_dlss_d.h` work as they do with Streamline. `kFeatureReflex`
+(`slReflexSetOptions`, `slReflexSleep`, `slReflexGetState`) and
+`kFeaturePCL` (`slPCLSetMarker`) work on the presenter's swapchain (below).
 
 Differences from Streamline:
 
 - Vulkan only, manual hooking only. Linux is tested; Windows is written but untested. There is no interposer, no swapchain or
-  present hooks, no D3D, no Reflex or other features.
+  present hooks, no D3D, and no features beyond the ones above.
 - Frame generation is evaluated by the application, as DLSS is: there is
   no swapchain hook to present the generated frame, and no
   `sl_dlss_g.h` or its options. Once per rendered frame, tag
@@ -86,6 +99,22 @@ Differences from Streamline:
   frame. One generated frame per rendered frame, colour buffers in LDR.
   The feature is made at the first evaluate and again when the sizes or
   format change; `slAllocateResources` does nothing for it.
+- Instead of Streamline's swapchain hooks and pacer, sl-ngx has a presenter
+  of its own (`include/sl_ngx/present.h`, found with `dlsym`): the
+  application gives it a surface it does not present to itself and, once
+  per rendered frame, the generated frame and the rendered one. On a queue
+  of its own (`slGetFeatureRequirements(kFeatureDLSS_G)` asks for one more
+  graphics queue) it copies the generated frame into its swapchain and
+  presents it, then the rendered one half a frame later, in FIFO. The
+  requirements name the device extensions it uses where the device has
+  them; the application enables each with its feature
+  (`presentId`, `presentId2`, `presentWait2`, `presentTiming`,
+  `swapchainMaintenance1`) and says which in `SlngxPresenterDesc::deviceBits`.
+- Reflex and PCL need the presenter: they use `VK_NV_low_latency2` on its
+  swapchain, with the present id `2 × frame + 2` (the rendered frame's
+  present), and do nothing without one. `slReflexSleep` returns at once
+  while Reflex is off with no frame limit. `ReflexOptions::frameLimitUs`
+  becomes the swapchain's minimum frame interval.
 - `slSetVulkanInfo` may be called with an instance and physical device but no
   device. `slGetFeatureRequirements` then also reports the device extensions
   NGX needs on that device, so the application can create its device with

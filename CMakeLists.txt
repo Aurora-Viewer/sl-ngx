@@ -8,10 +8,11 @@ if(NOT DLSS_SDK)
     message(FATAL_ERROR "set -DDLSS_SDK to the folder holding NVIDIA's DLSS SDK")
 endif()
 find_package(Vulkan REQUIRED)
+find_package(Threads REQUIRED)
 
-add_library(sl_ngx SHARED src/sl_ngx.cpp)
+add_library(sl_ngx SHARED src/sl_ngx.cpp src/presenter.cpp)
 target_include_directories(sl_ngx PRIVATE include ${DLSS_SDK}/include)
-target_link_libraries(sl_ngx PRIVATE Vulkan::Vulkan)
+target_link_libraries(sl_ngx PRIVATE Vulkan::Vulkan Threads::Threads)
 if(WIN32)
     # NVIDIA's static NGX core for the MSVC runtime the build uses
     if(CMAKE_MSVC_RUNTIME_LIBRARY MATCHES "DLL" OR NOT CMAKE_MSVC_RUNTIME_LIBRARY)

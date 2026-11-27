@@ -15,6 +15,10 @@
 #include "sl/sl_dlss.h"
 #include "sl/sl_dlss_d.h"
 #include "sl/sl_helpers_vk.h"
+#include "sl/sl_pcl.h"
+#include "sl/sl_reflex.h"
+
+#include "internal.h"
 
 #include <nvsdk_ngx_vk.h>
 #include <nvsdk_ngx_helpers.h>
@@ -31,6 +35,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <map>
 #include <mutex>
 #include <string>
@@ -185,6 +190,12 @@ NVSDK_NGX_Feature ngxFeature(sl::Feature f)
 bool ours(sl::Feature f)
 {
     return f == sl::kFeatureDLSS || f == sl::kFeatureDLSS_RR || f == sl::kFeatureDLSS_G;
+}
+
+// Reflex and PCL: on the presenter's swapchain (presenter.cpp), not NGX.
+bool latency(sl::Feature f)
+{
+    return f == sl::kFeatureReflex || f == sl::kFeaturePCL;
 }
 
 // The folder holding this library: where the setup puts NVIDIA's model
@@ -619,6 +630,35 @@ Result requirementsFor(sl::Feature feature)
                 return;
         to.emplace_back(name);
     };
+    // the presenter's (frame generation) and Reflex's, where the device has them
+    const VkPhysicalDevice pd = g.queryPhysicalDevice ? g.queryPhysicalDevice : g.physicalDevice;
+    auto addIfDevice = [&](std::initializer_list<const char*> names) {
+        for (auto n : names)
+            if (pd && slngx::deviceHasExtension(pd, n))
+                add(dev, n);
+    };
+    if (feature == sl::kFeatureDLSS_G)
+    {
+        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_NV_LOW_LATENCY_2_EXTENSION_NAME, "VK_KHR_present_id2",
+            "VK_KHR_present_wait2", "VK_KHR_swapchain_maintenance1"});
+        // present timing (the shown counts) needs calibrated timestamps beside it
+        if (pd && slngx::deviceHasExtension(pd, "VK_EXT_present_timing") &&
+            slngx::deviceHasExtension(pd, "VK_KHR_present_id2") &&
+            slngx::deviceHasExtension(pd, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME))
+        {
+            add(dev, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
+            add(dev, "VK_EXT_present_timing");
+        }
+        for (auto n : {VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME, "VK_KHR_surface_maintenance1"})
+            if (slngx::instanceHasExtension(n))
+                add(inst, n);
+    }
+    if (latency(feature))
+    {
+        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, VK_NV_LOW_LATENCY_2_EXTENSION_NAME});
+    }
+    else
+    {
     // what Streamline's DLSS plugins ask for on any NVIDIA device
     for (auto n : {VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
              VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME, VK_KHR_EXTERNAL_SEMAPHORE_CAPABILITIES_EXTENSION_NAME})
@@ -642,6 +682,7 @@ Result requirementsFor(sl::Feature feature)
                 g.queryInstance, g.queryPhysicalDevice, &info, &count, &props)))
             for (uint32_t i = 0; i < count && props; i++)
                 add(dev, props[i].extensionName);
+    }
     }
     auto& ip = g.instanceExts[feature];
     auto& dp = g.deviceExts[feature];
@@ -881,6 +922,60 @@ Result evaluateFg(VkCommandBuffer cmd, Viewport& vp, const sl::Constants& c, con
 
 } // namespace
 
+// ---- what presenter.cpp uses (internal.h) ----
+
+namespace slngx
+{
+
+bool currentDevice(VkInstance& instance, VkPhysicalDevice& physicalDevice, VkDevice& device)
+{
+    std::lock_guard<std::mutex> l(g.lock);
+    instance = g.instance;
+    physicalDevice = g.physicalDevice;
+    device = g.device;
+    return g.initialized && g.device;
+}
+
+void log(sl::LogType type, const char* fmt, ...)
+{
+    if (!g.log || g.logLevel == sl::LogLevel::eOff)
+        return;
+    char buf[1024];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    g.log(type, buf);
+}
+
+bool deviceHasExtension(VkPhysicalDevice physicalDevice, const char* name)
+{
+    uint32_t n = 0;
+    if (vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, nullptr) != VK_SUCCESS)
+        return false;
+    std::vector<VkExtensionProperties> props(n);
+    vkEnumerateDeviceExtensionProperties(physicalDevice, nullptr, &n, props.data());
+    for (auto& p : props)
+        if (std::strcmp(p.extensionName, name) == 0)
+            return true;
+    return false;
+}
+
+bool instanceHasExtension(const char* name)
+{
+    uint32_t n = 0;
+    if (vkEnumerateInstanceExtensionProperties(nullptr, &n, nullptr) != VK_SUCCESS)
+        return false;
+    std::vector<VkExtensionProperties> props(n);
+    vkEnumerateInstanceExtensionProperties(nullptr, &n, props.data());
+    for (auto& p : props)
+        if (std::strcmp(p.extensionName, name) == 0)
+            return true;
+    return false;
+}
+
+} // namespace slngx
+
 // ---- the exported interface (sl_core_api.h, sl_helpers_vk.h) ----
 
 extern "C" {
@@ -934,6 +1029,7 @@ SL_NGX_EXPORT Result slShutdown()
     std::lock_guard<std::mutex> l(g.lock);
     if (!g.initialized)
         return Result::eErrorNotInitialized;
+    slngx::endPresenter();
     stopNgx();
     g.viewports.clear();
     g.instanceExts.clear();
@@ -973,7 +1069,10 @@ SL_NGX_EXPORT Result slSetVulkanInfo(const sl::VulkanInfo& info)
     if (g.started && info.device == g.device)
         return Result::eOk;
     if (g.started)
+    {
+        slngx::endPresenter();
         abandonNgx();
+    }
     g.instance = info.instance;
     g.physicalDevice = info.physicalDevice;
     g.device = info.device;
@@ -985,6 +1084,14 @@ SL_NGX_EXPORT Result slIsFeatureSupported(sl::Feature feature, const sl::Adapter
     std::lock_guard<std::mutex> l(g.lock);
     if (!g.initialized)
         return Result::eErrorInitNotCalled;
+    if (latency(feature))
+    {
+        const VkPhysicalDevice pd = g.physicalDevice ? g.physicalDevice : g.queryPhysicalDevice;
+        if (!pd)
+            return Result::eErrorDeviceNotCreated;
+        return slngx::deviceHasExtension(pd, VK_NV_LOW_LATENCY_2_EXTENSION_NAME) ? Result::eOk
+                                                                                 : Result::eErrorFeatureNotSupported;
+    }
     if (!ours(feature))
         return Result::eErrorFeatureMissing;
     if (adapter.vkPhysicalDevice && adapter.vkPhysicalDevice != (void*)g.physicalDevice)
@@ -997,7 +1104,7 @@ SL_NGX_EXPORT Result slGetFeatureRequirements(sl::Feature feature, sl::FeatureRe
     std::lock_guard<std::mutex> l(g.lock);
     if (!g.initialized)
         return Result::eErrorInitNotCalled;
-    if (!ours(feature))
+    if (!ours(feature) && !latency(feature))
         return Result::eErrorFeatureMissing;
     Result r = requirementsFor(feature);
     if (r != Result::eOk)
@@ -1015,17 +1122,19 @@ SL_NGX_EXPORT Result slGetFeatureRequirements(sl::Feature feature, sl::FeatureRe
     req.flags = sl::FeatureRequirementFlags::eVulkanSupported;
     req.maxNumCPUThreads = 1;
     req.maxNumViewports = 0;
-    req.numRequiredTags = fg ? 3 : rr ? 7 : 4;
-    req.requiredTags = fg ? kFgTags : rr ? kRrTags : kDlssTags;
+    const bool lat = latency(feature);
+    req.numRequiredTags = lat ? 0 : fg ? 3 : rr ? 7 : 4;
+    req.requiredTags = lat ? nullptr : fg ? kFgTags : rr ? kRrTags : kDlssTags;
     req.vkNumComputeQueuesRequired = 0;
-    req.vkNumGraphicsQueuesRequired = 0;
+    // the presenter's own queue (include/sl_ngx/present.h)
+    req.vkNumGraphicsQueuesRequired = fg ? 1 : 0;
     req.vkNumDeviceExtensions = (uint32_t)g.deviceExts[feature].size();
     req.vkDeviceExtensions = g.deviceExts[feature].data();
     req.vkNumInstanceExtensions = (uint32_t)g.instanceExts[feature].size();
     req.vkInstanceExtensions = g.instanceExts[feature].data();
     if (req.structVersion >= sl::kStructVersion2)
     {
-        req.vkNumFeatures12 = 3;
+        req.vkNumFeatures12 = lat ? 1 : 3;
         req.vkFeatures12 = kFeatures12;
         req.vkNumFeatures13 = 0;
         req.vkFeatures13 = nullptr;
@@ -1036,7 +1145,7 @@ SL_NGX_EXPORT Result slGetFeatureRequirements(sl::Feature feature, sl::FeatureRe
 
 SL_NGX_EXPORT Result slGetFeatureVersion(sl::Feature feature, sl::FeatureVersion& version)
 {
-    if (!ours(feature))
+    if (!ours(feature) && !latency(feature))
         return Result::eErrorFeatureMissing;
     version.versionSL = sl::Version(SL_VERSION_MAJOR, SL_VERSION_MINOR, SL_VERSION_PATCH);
     version.versionNGX = sl::Version(0, 0, 0);
@@ -1061,6 +1170,10 @@ SL_NGX_EXPORT Result slGetFeatureFunction(sl::Feature feature, const char* name,
         {sl::kFeatureDLSS_RR, "slDLSSDGetOptimalSettings", reinterpret_cast<void*>(&dlssdGetOptimalSettings)},
         {sl::kFeatureDLSS_RR, "slDLSSDGetState", reinterpret_cast<void*>(&dlssdGetState)},
         {sl::kFeatureDLSS_RR, "slDLSSDSetOptions", reinterpret_cast<void*>(&dlssdSetOptions)},
+        {sl::kFeatureReflex, "slReflexGetState", reinterpret_cast<void*>(&slngx::reflexGetState)},
+        {sl::kFeatureReflex, "slReflexSleep", reinterpret_cast<void*>(&slngx::reflexSleep)},
+        {sl::kFeatureReflex, "slReflexSetOptions", reinterpret_cast<void*>(&slngx::reflexSetOptions)},
+        {sl::kFeaturePCL, "slPCLSetMarker", reinterpret_cast<void*>(&slngx::pclSetMarker)},
     };
     for (auto& e : kTable)
     {
@@ -1070,7 +1183,7 @@ SL_NGX_EXPORT Result slGetFeatureFunction(sl::Feature feature, const char* name,
             return Result::eOk;
         }
     }
-    return ours(feature) ? Result::eErrorMissingOrInvalidAPI : Result::eErrorFeatureMissing;
+    return ours(feature) || latency(feature) ? Result::eErrorMissingOrInvalidAPI : Result::eErrorFeatureMissing;
 }
 
 SL_NGX_EXPORT Result slGetNewFrameToken(sl::FrameToken*& token, const uint32_t* frameIndex)
