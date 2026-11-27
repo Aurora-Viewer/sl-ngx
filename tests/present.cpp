@@ -5,10 +5,14 @@
 // the real one, cleared on the application's queue.
 //
 //   tests/present [frames]
-// Runs: generated and real frames; real frames alone; pause around a
-// vkDeviceWaitIdle; a resize; a frame whose `ready` never comes; destroy
-// with a frame queued; a presenter without VK_NV_low_latency2 (no latency
-// reports); slShutdown with a presenter alive.
+// Runs: Reflex off; the viewer's configuration (VK_NV_low_latency2 alone,
+// images held in TRANSFER_SRC_OPTIMAL, real frames first, a frame number
+// that repeats); a Reflex frame limit; the error codes of create and of
+// frames that break the contract; generated and real frames; real
+// frames alone; pause around a vkDeviceWaitIdle; a resize; a frame whose
+// `ready` never comes; an unbounded hand-over wait; destroy with a frame
+// queued; a presenter without VK_NV_low_latency2 (no latency reports);
+// slShutdown with a presenter alive.
 // Exit 0: every check held and the validation layer reported no error.
 // Exit 2: no NVIDIA device or not supported here.
 #include <vulkan/vulkan.h>
@@ -214,8 +218,11 @@ struct Run
     VkSemaphore ready, released;
     uint64_t n = 0;     // frames handed over or released by the caller so far
     uint64_t timeouts = 0;
+    VkImageLayout held = kHeld; // the layout the images are handed over in
+    int64_t fixedFrame = -1;    // >= 0: the frame number given instead of the token's
 
-    VkResult frame(SlngxPresenter* p, bool generated, VkSemaphore readyOverride = VK_NULL_HANDLE)
+    VkResult frame(SlngxPresenter* p, bool generated, VkSemaphore readyOverride = VK_NULL_HANDLE,
+        uint64_t timeoutNs = 2000000000ull)
     {
         n++;
         // the set comes back once the presenter released the frame three before
@@ -241,7 +248,7 @@ struct Run
             VkClearColorValue c{{i ? t : 1.0f - t, i ? 0.2f : 0.6f, i ? 1.0f - t : t, 1.0f}};
             VkImageSubresourceRange r{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             vkCmdClearColorImage(s.cb, s.image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, &c, 1, &r);
-            barrier(s.cb, s.image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, kHeld);
+            barrier(s.cb, s.image[i], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, held);
         }
         VK(vkEndCommandBuffer(s.cb));
         VkTimelineSemaphoreSubmitInfo ts{VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO};
@@ -257,15 +264,15 @@ struct Run
         SL(api.marker(sl::PCLMarker::eRenderSubmitEnd, *token));
         SL(api.marker(sl::PCLMarker::ePresentStart, *token));
         SlngxPresentFrame f{SLNGX_PRESENTER_VERSION};
-        f.frame = (uint32_t)*token;
+        f.frame = fixedFrame >= 0 ? (uint32_t)fixedFrame : (uint32_t)*token;
         if (generated)
-            f.generated = {s.image[0], kHeld, W, H};
-        f.real = {s.image[1], kHeld, W, H};
+            f.generated = {s.image[0], held, W, H};
+        f.real = {s.image[1], held, W, H};
         f.ready = readyOverride ? readyOverride : ready;
         f.readyValue = readyOverride ? 1 : n;
         f.released = released;
         f.releasedValue = n;
-        VkResult r = slngxPresent(p, &f, 2000000000ull);
+        VkResult r = slngxPresent(p, &f, timeoutNs);
         SL(api.marker(sl::PCLMarker::ePresentEnd, *token));
         if (r != VK_SUCCESS)
         {
@@ -354,12 +361,28 @@ int main(int argc, char** argv)
     for (Uint32 i = 0; i < sdlN; i++)
         iext.emplace_back(sdlE[i]);
     const bool validation = hasLayer("VK_LAYER_KHRONOS_validation");
+    // the layer's settings (sync and thread-safety validation) need its VK_EXT_layer_settings
+    bool layerSettings = false;
     if (validation)
+    {
         iext.emplace_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+        uint32_t n = 0;
+        vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &n, nullptr);
+        std::vector<VkExtensionProperties> e(n);
+        vkEnumerateInstanceExtensionProperties("VK_LAYER_KHRONOS_validation", &n, e.data());
+        for (auto& x : e)
+            layerSettings |= !std::strcmp(x.extensionName, VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
+    }
+    VkDebugUtilsMessengerCreateInfoEXT mi{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+    mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
+    mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+    mi.pfnUserCallback = onValidation;
     auto makeInstance = [&](bool withLayer) {
         std::vector<const char*> names;
         for (auto& e : iext)
             names.push_back(e.c_str());
+        if (withLayer && layerSettings)
+            names.push_back(VK_EXT_LAYER_SETTINGS_EXTENSION_NAME);
         const char* layer = "VK_LAYER_KHRONOS_validation";
         VkBool32 on = VK_TRUE;
         VkLayerSettingEXT settings[] = {
@@ -369,10 +392,12 @@ int main(int argc, char** argv)
         VkLayerSettingsCreateInfoEXT ls{VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT};
         ls.settingCount = 2;
         ls.pSettings = settings;
+        // the messenger from the start, so that instance creation's own errors count
+        mi.pNext = withLayer && layerSettings ? &ls : nullptr;
         VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO};
         app.apiVersion = VK_API_VERSION_1_3;
         VkInstanceCreateInfo ci{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO};
-        ci.pNext = withLayer ? &ls : nullptr;
+        ci.pNext = withLayer ? (const void*)&mi : nullptr;
         ci.pApplicationInfo = &app;
         ci.enabledLayerCount = withLayer ? 1 : 0;
         ci.ppEnabledLayerNames = &layer;
@@ -429,13 +454,11 @@ int main(int argc, char** argv)
     {
         auto create = (PFN_vkCreateDebugUtilsMessengerEXT)vkGetInstanceProcAddr(g.instance,
             "vkCreateDebugUtilsMessengerEXT");
-        VkDebugUtilsMessengerCreateInfoEXT mi{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
-        mi.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_SEVERITY_WARNING_BIT_EXT;
-        mi.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_VALIDATION_BIT_EXT | VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
-        mi.pfnUserCallback = onValidation;
+        mi.pNext = nullptr;
         VK(create(g.instance, &mi, nullptr, &messenger));
     }
-    std::printf("validation layer: %s\n", validation ? "on (sync, thread safety)" : "not installed");
+    std::printf("validation layer: %s\n",
+        !validation ? "not installed" : layerSettings ? "on (sync, thread safety)" : "on (no VK_EXT_layer_settings: default checks)");
     g.pd = nvidia(g.instance);
     VkSurfaceKHR surface;
     if (!SDL_Vulkan_CreateSurface(win, g.instance, nullptr, &surface))
@@ -553,7 +576,103 @@ int main(int argc, char** argv)
     sl::ReflexOptions o{};
     o.mode = sl::ReflexMode::eLowLatency;
     SL(api.setOptions(o));
+
+    // the viewer's configuration: VK_NV_low_latency2 alone, the images held
+    // in TRANSFER_SRC_OPTIMAL, a fresh presenter whose first frames come
+    // without a generated image, then a frame number that repeats (a frame
+    // token the application could not get)
+    if (g.presenterBits & SLNGX_DEVICE_LOW_LATENCY2)
+    {
+        const int errorsBefore = validationErrors;
+        SlngxPresenter* v = makePresenter(g, surface, SLNGX_DEVICE_LOW_LATENCY2);
+        run.held = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+        for (int i = 0; i < 6; i++)
+            run.frame(v, false);
+        for (int i = 0; i < 30; i++)
+            run.frame(v, true);
+        run.fixedFrame = 0;
+        for (int i = 0; i < 10; i++)
+            run.frame(v, true);
+        run.fixedFrame = -1;
+        for (int i = 0; i < 10; i++)
+            run.frame(v, true);
+        VK(slngxPresenterPause(v));
+        auto sv = stats(v);
+        print("viewer configuration", sv);
+        // the pause may release the last frame unshown
+        check(sv.realPresented + sv.framesSkipped == 56 && sv.realPresented >= 55 &&
+                sv.generatedPresented <= 50 && sv.generatedPresented + 6 >= sv.realPresented,
+            "viewer configuration: every frame presented, the generated ones too");
+        check(validationErrors == errorsBefore, "viewer configuration: no validation error (repeated frame numbers too)");
+        slngxPresenterResume(v);
+        slngxPresenterDestroy(v);
+        run.held = kHeld;
+    }
+
+    // a Reflex frame limit is per rendered frame: two presents each
+    {
+        sl::ReflexOptions lim = o;
+        // 10 rendered frames a second: slower than a FIFO pair even where the
+        // compositor halves the rate (a workspace not on screen)
+        lim.frameLimitUs = 100000;
+        SL(api.setOptions(lim));
+        SlngxPresenter* q = makePresenter(g, surface, g.presenterBits);
+        for (int i = 0; i < 30; i++)
+            run.frame(q, true);
+        VK(slngxPresenterPause(q));
+        auto sq = stats(q);
+        print("frame limit 100 ms", sq);
+        check(sq.intervalMs > 85 && sq.intervalMs < 130, "a 100 ms frame limit gives 100 ms rendered frames");
+        check(sq.generatedPresented + 1 >= sq.realPresented, "a frame limit drops no generated frame");
+        slngxPresenterResume(q);
+        slngxPresenterDestroy(q);
+        SL(api.setOptions(o));
+    }
+
+    // the contract's error codes
+    {
+        SlngxPresenterDesc d{SLNGX_PRESENTER_VERSION + 1};
+        d.surface = surface;
+        d.queueIndex = 1;
+        d.width = W, d.height = H;
+        d.format = VK_FORMAT_B8G8R8A8_UNORM;
+        d.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        SlngxPresenter* x = nullptr;
+        check(slngxPresenterCreate(&d, &x) == VK_ERROR_INCOMPATIBLE_DRIVER && !x,
+            "create: another version answers VK_ERROR_INCOMPATIBLE_DRIVER");
+        d.version = SLNGX_PRESENTER_VERSION;
+        d.format = VK_FORMAT_R8_UNORM;
+        check(slngxPresenterCreate(&d, &x) == VK_ERROR_FORMAT_NOT_SUPPORTED && !x,
+            "create: a format the surface lacks answers VK_ERROR_FORMAT_NOT_SUPPORTED");
+        d.format = VK_FORMAT_B8G8R8A8_UNORM;
+        d.queueIndex = 99;
+        check(slngxPresenterCreate(&d, &x) == VK_ERROR_INITIALIZATION_FAILED && !x,
+            "create: no such queue answers VK_ERROR_INITIALIZATION_FAILED");
+    }
+
     SlngxPresenter* p = makePresenter(g, surface, g.presenterBits);
+    const uint64_t nAtP = run.n, timeoutsAtP = run.timeouts;
+    {
+        SlngxPresenterDesc d{SLNGX_PRESENTER_VERSION};
+        d.surface = surface;
+        d.queueIndex = 1;
+        d.width = W, d.height = H;
+        d.format = VK_FORMAT_B8G8R8A8_UNORM;
+        d.colorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
+        SlngxPresenter* x = nullptr;
+        check(slngxPresenterCreate(&d, &x) == VK_ERROR_INITIALIZATION_FAILED && !x,
+            "create: a second presenter answers VK_ERROR_INITIALIZATION_FAILED");
+        // refused before any Vulkan call: the image handle is never used
+        SlngxPresentFrame f{SLNGX_PRESENTER_VERSION};
+        f.real.image = reinterpret_cast<VkImage>(uintptr_t(1));
+        f.real.layout = kHeld;
+        f.real.width = 0, f.real.height = H;
+        f.ready = run.ready;
+        check(slngxPresent(p, &f, 0) == VK_ERROR_INITIALIZATION_FAILED, "a frame of size zero is refused");
+        f.real.width = W;
+        f.real.layout = VK_IMAGE_LAYOUT_UNDEFINED;
+        check(slngxPresent(p, &f, 0) == VK_ERROR_INITIALIZATION_FAILED, "a frame in an undefined layout is refused");
+    }
 
     // 1. generated and real
     for (int i = 0; i < frames; i++)
@@ -562,6 +681,8 @@ int main(int argc, char** argv)
     auto s1 = stats(p);
     slngxPresenterResume(p);
     print("generated + real", s1);
+    check(s1.generatedPresented == s1.realPresented && s1.realPresented + s1.framesSkipped == (uint64_t)frames,
+        "generated + real: both presented for every frame");
     // 2. real alone
     for (int i = 0; i < 30; i++)
         run.frame(p, false);
@@ -600,11 +721,22 @@ int main(int argc, char** argv)
     auto s5 = stats(p);
     print("after a frame never ready", s5);
     check(s5.framesSkipped == skippedBefore + 1, "a frame never ready is skipped, and released");
+    // an unbounded wait to hand over (UINT64_MAX) waits, with a frame queued behind one never ready
+    {
+        const uint64_t timeoutsBefore = run.timeouts;
+        run.frame(p, true, never);
+        run.frame(p, true);
+        VkResult r = run.frame(p, true, VK_NULL_HANDLE, UINT64_MAX);
+        check(r == VK_SUCCESS && run.timeouts == timeoutsBefore, "a UINT64_MAX hand-over waits until taken");
+        waitValue(g, run.released, run.n);
+    }
     // the totals
     VK(slngxPresenterPause(p));
     auto all = stats(p);
     print("totals", all);
-    check(all.framesAccepted + run.timeouts == run.n, "every frame was taken or released by the caller");
+    check(all.framesAccepted + (run.timeouts - timeoutsAtP) == run.n - nAtP,
+        "every frame was taken or released by the caller");
+    check(run.timeouts == 0, "no hand-over timed out");
     check(all.framesAccepted == all.realPresented + all.framesSkipped, "every frame taken was presented or skipped");
     check(all.lastError == VK_SUCCESS, "no present failed");
     check(all.lowLatency == 1, "VK_NV_low_latency2 is on the swapchain");
