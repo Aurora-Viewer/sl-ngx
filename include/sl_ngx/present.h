@@ -38,7 +38,11 @@ typedef enum SlngxPresenterDeviceBits
     SLNGX_DEVICE_LOW_LATENCY2 = 1 << 0,  // VK_NV_low_latency2 (and VK_KHR_present_id, presentId)
     SLNGX_DEVICE_PRESENT_ID2 = 1 << 1,   // VK_KHR_present_id2, presentId2
     SLNGX_DEVICE_PRESENT_WAIT2 = 1 << 2, // VK_KHR_present_wait2, presentWait2: accepted, not used yet
-    SLNGX_DEVICE_PRESENT_TIMING = 1 << 3 // VK_EXT_present_timing, presentTiming (and VK_KHR_swapchain_maintenance1)
+    SLNGX_DEVICE_PRESENT_TIMING = 1 << 3, // VK_EXT_present_timing, presentTiming (and VK_KHR_swapchain_maintenance1)
+    // VK_KHR_swapchain_maintenance1 (or EXT), swapchainMaintenance1: the presenter destroys a
+    // swapchain once its present fences say the presentation engine is done with it; without
+    // it, once its queue is idle, which is all VK_KHR_swapchain offers
+    SLNGX_DEVICE_SWAPCHAIN_MAINTENANCE1 = 1 << 4
 } SlngxPresenterDeviceBits;
 
 typedef struct SlngxPresenterDesc
@@ -49,7 +53,8 @@ typedef struct SlngxPresenterDesc
     uint32_t queueFamily;       // a graphics queue no one else submits to or presents on, of the
                                 // family that writes the images, unless they are VK_SHARING_MODE_CONCURRENT
                                 // (the presenter does no queue family ownership transfer)
-    uint32_t queueIndex;
+    uint32_t queueIndex;        // one of the queues the device was created with in that family (the
+                                // presenter can check it only against the family's queueCount)
     uint32_t deviceBits;        // SlngxPresenterDeviceBits
     uint32_t width, height;     // the swapchain size, where the surface leaves it to the application
     VkFormat format;            // the swapchain format, with VK_FORMAT_FEATURE_BLIT_DST_BIT; it and
@@ -62,8 +67,8 @@ typedef struct SlngxPresentImage
     VkImage image;              // VK_IMAGE_USAGE_TRANSFER_SRC_BIT, format with VK_FORMAT_FEATURE_BLIT_SRC_BIT,
                                 // and VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT where its size can
                                 // differ from the swapchain's (the copy is then a linear blit)
-    VkImageLayout layout;       // its layout when `ready` is reached, not UNDEFINED; the presenter leaves it
-                                // in that layout
+    VkImageLayout layout;       // its layout when `ready` is reached, not UNDEFINED or PREINITIALIZED (no
+                                // barrier goes to either); the presenter leaves it in that layout
     uint32_t width, height;     // not zero
 } SlngxPresentImage;
 
@@ -100,7 +105,8 @@ typedef struct SlngxPresenterStats
     float copyGpuMs;            // the GPU time of the presenter's copies for one rendered frame, averaged
     float intervalMs;           // between rendered frames as they reached `ready`, averaged
     float presentHalfMs;        // the wait between the generated frame's present and the rendered one's
-    int32_t lastError;          // the last VkResult that stopped a frame, VK_SUCCESS if none
+    int32_t lastError;          // the last VkResult that stopped a frame, VK_SUCCESS if none; one that
+                                // stopped the presenter too is what slngxPresent answers
     uint32_t deviceLost;        // 1: the presenter stopped on a lost device
 } SlngxPresenterStats;
 
@@ -120,7 +126,11 @@ VkResult slngxPresenterCreate(const SlngxPresenterDesc* desc, SlngxPresenter** p
 // with every result but VK_SUCCESS. VK_NOT_READY: paused.
 // VK_ERROR_INITIALIZATION_FAILED: the frame is not valid as described above.
 // VK_ERROR_DEVICE_LOST: the device is lost or the presenter was ended.
-// Any other: the presenter stopped on that error; destroy it.
+// Any other: the presenter stopped on that error; destroy it (and, for
+// VK_ERROR_SURFACE_LOST_KHR, make a new surface). A frame stops on a late
+// `ready` or swapchain image (VK_TIMEOUT), a minimised window, or a
+// swapchain out of date or suboptimal, and the presenter goes on; on any
+// other error (a lost surface, no memory, a lost device) it stops.
 VkResult slngxPresent(SlngxPresenter* presenter, const SlngxPresentFrame* frame, uint64_t timeoutNs);
 
 // The size the swapchain is made at next, where the surface leaves it to
@@ -131,6 +141,9 @@ void slngxPresenterResize(SlngxPresenter* presenter, uint32_t width, uint32_t he
 // is released; until slngxPresenterResume it submits nothing. Call it
 // around anything that waits for the whole device (vkDeviceWaitIdle: a
 // wgpu surface configured or dropped).
+// VK_ERROR_DEVICE_LOST: the device is lost or the presenter was ended.
+// Any other: the wait for its queue failed; the presenter stopped on that
+// error, as slngxPresent's, and frames it had not taken are not released.
 VkResult slngxPresenterPause(SlngxPresenter* presenter);
 void slngxPresenterResume(SlngxPresenter* presenter);
 
@@ -145,6 +158,9 @@ void slngxPresenterResume(SlngxPresenter* presenter);
 // destroyed. Call those from the thread that calls the presenter.
 void slngxPresenterDestroy(SlngxPresenter* presenter);
 
+// Collects the shown counts present timing has reported since, whether
+// frames follow or not. VK_ERROR_INITIALIZATION_FAILED: a null argument or
+// another version. VK_ERROR_DEVICE_LOST: the presenter was ended.
 VkResult slngxPresenterGetStats(SlngxPresenter* presenter, SlngxPresenterStats* stats);
 
 typedef VkResult (*PFN_slngxPresenterCreate)(const SlngxPresenterDesc*, SlngxPresenter**);
