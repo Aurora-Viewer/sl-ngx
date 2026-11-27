@@ -641,9 +641,10 @@ Result requirementsFor(sl::Feature feature)
     {
         // names, not the headers' macros: the presenter leaves out what the
         // headers it was built with lack, and asks only for what it uses
-        addIfDevice({VK_KHR_PRESENT_ID_EXTENSION_NAME, "VK_KHR_swapchain_maintenance1"});
+        addIfDevice({"VK_KHR_swapchain_maintenance1"});
 #if defined(VK_NV_low_latency2)
-        addIfDevice({"VK_NV_low_latency2"});
+        // VK_KHR_present_id: the ids VK_NV_low_latency2's markers match presents by
+        addIfDevice({"VK_KHR_present_id", "VK_NV_low_latency2"});
 #endif
 #if defined(VK_KHR_present_id2)
         addIfDevice({"VK_KHR_present_id2", "VK_KHR_present_wait2"});
@@ -1079,12 +1080,11 @@ SL_NGX_EXPORT Result slSetVulkanInfo(const sl::VulkanInfo& info)
         return Result::eOk;
     if (g.started && info.device == g.device)
         return Result::eOk;
-    if (g.started)
-    {
-        // the old device may be lost: no call on it, as for NGX
+    // the old device may be lost: no call on it. The presenter needs only
+    // the device, not NGX: it ends on any device change, NGX started or not.
+    if (g.device && info.device != g.device)
         slngx::abandonPresenter();
-        abandonNgx();
-    }
+    abandonNgx();
     g.instance = info.instance;
     g.physicalDevice = info.physicalDevice;
     g.device = info.device;
